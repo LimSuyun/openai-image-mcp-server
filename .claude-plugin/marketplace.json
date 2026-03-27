@@ -1,0 +1,16 @@
+{
+  "name": "openai-image-marketplace",
+  "owner": {
+    "name": "LimSuyun"
+  },
+  "metadata": {
+    "description": "OpenAI image generation plugin for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "openai-image",
+      "description": "Generate, edit, and create variations of images using OpenAI's image models (DALL-E 2, DALL-E 3, gpt-image-1). Requires OPENAI_API_KEY environment variable.",
+      "source": "./"
+    }
+  ]
+}

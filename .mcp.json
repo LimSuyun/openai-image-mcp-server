@@ -1,0 +1,7 @@
+{
+  "openai-image": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "openai-image-mcp-server"]
+  }
+}

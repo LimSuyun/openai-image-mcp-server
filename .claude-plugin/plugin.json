@@ -1,0 +1,12 @@
+{
+  "name": "openai-image",
+  "description": "Generate, edit, and create variations of images using OpenAI's image models (DALL-E 2, DALL-E 3, gpt-image-1)",
+  "version": "1.0.0",
+  "author": {
+    "name": "LimSuyun"
+  },
+  "repository": "https://github.com/LimSuyun/openai-image-mcp-server",
+  "homepage": "https://www.npmjs.com/package/openai-image-mcp-server",
+  "license": "MIT",
+  "keywords": ["openai", "image", "dall-e", "gpt-image", "mcp", "generation"]
+}
