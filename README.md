@@ -71,6 +71,30 @@ Add to your VS Code `settings.json`:
 }
 ```
 
+### Claude Code
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "OPENAI_API_KEY": "sk-..."
+  },
+  "mcpServers": {
+    "openai-image": {
+      "command": "npx",
+      "args": ["-y", "openai-image-mcp-server"]
+    }
+  }
+}
+```
+
+Or via CLI:
+
+```bash
+claude mcp add openai-image -e OPENAI_API_KEY=sk-... -- npx -y openai-image-mcp-server
+```
+
 ### Manual (from source)
 
 ```bash
