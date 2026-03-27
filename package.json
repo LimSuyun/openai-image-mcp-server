@@ -4,6 +4,9 @@
   "description": "MCP server for OpenAI image generation (DALL-E 2, DALL-E 3, gpt-image-1)",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "openai-image-mcp-server": "dist/index.js"
+  },
   "scripts": {
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",

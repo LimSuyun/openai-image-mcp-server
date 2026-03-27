@@ -1,7 +1,9 @@
 {
-  "openai-image": {
-    "type": "stdio",
-    "command": "npx",
-    "args": ["-y", "openai-image-mcp-server"]
+  "mcpServers": {
+    "openai-image": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/Users/lsy/gpt_image_gen_mcp/dist/index.js"]
+    }
   }
 }
