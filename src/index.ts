@@ -9,7 +9,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 import fs from "fs";
 import path from "path";
 
@@ -389,10 +389,10 @@ const EditImageSchema = z
           "If omitted the entire image is eligible for editing."
       ),
     model: z
-      .enum(["dall-e-2", "gpt-image-1"])
-      .default("gpt-image-1")
+      .enum(["dall-e-2"])
+      .default("dall-e-2")
       .describe(
-        "Model for editing. Only dall-e-2 and gpt-image-1 support image editing."
+        "Model for editing. Only dall-e-2 supports image editing."
       ),
     n: z
       .number()
@@ -456,10 +456,6 @@ Examples:
   },
   async (params: EditImageInput) => {
     try {
-      // gpt-image-1 only supports b64_json
-      const responseFormat =
-        params.model === "gpt-image-1" ? ResponseFormat.B64_JSON : params.response_format;
-
       if (!fs.existsSync(params.image_path)) {
         return {
           isError: true,
@@ -479,7 +475,7 @@ Examples:
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
         }
-        if (responseFormat !== ResponseFormat.B64_JSON) {
+        if (params.response_format !== ResponseFormat.B64_JSON) {
           return {
             isError: true,
             content: [
@@ -493,19 +489,21 @@ Examples:
       }
 
       const client = getClient();
+      const imageName = path.basename(params.image_path);
 
       const requestParams: OpenAI.Images.ImageEditParams = {
-        image: fs.createReadStream(params.image_path),
+        image: await toFile(fs.createReadStream(params.image_path), imageName, { type: "image/png" }),
         prompt: params.prompt,
         model: params.model,
         n: params.n,
         size: params.size as OpenAI.Images.ImageEditParams["size"],
         response_format:
-          responseFormat as OpenAI.Images.ImageEditParams["response_format"],
+          params.response_format as OpenAI.Images.ImageEditParams["response_format"],
       };
 
       if (params.mask_path) {
-        requestParams.mask = fs.createReadStream(params.mask_path);
+        const maskName = path.basename(params.mask_path);
+        requestParams.mask = await toFile(fs.createReadStream(params.mask_path), maskName, { type: "image/png" });
       }
 
       const response = await client.images.edit(requestParams);
@@ -513,7 +511,7 @@ Examples:
 
       const { content, metadata } = collectImageContent(
         images,
-        responseFormat,
+        params.response_format,
         params.output_directory,
         "edited"
       );
