@@ -278,9 +278,9 @@ Examples:
   },
   async (params: GenerateImageInput) => {
     try {
-      // gpt-image-1 only supports b64_json
-      const responseFormat =
-        params.model === "gpt-image-1" ? ResponseFormat.B64_JSON : params.response_format;
+      // gpt-image-1 does not accept response_format param; always returns b64_json
+      const isGptImage1 = params.model === "gpt-image-1";
+      const responseFormat = isGptImage1 ? ResponseFormat.B64_JSON : params.response_format;
 
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
@@ -309,9 +309,13 @@ Examples:
         model: params.model,
         n: params.n,
         size: params.size as OpenAI.Images.ImageGenerateParams["size"],
-        response_format:
-          responseFormat as OpenAI.Images.ImageGenerateParams["response_format"],
       };
+
+      // gpt-image-1 does not support response_format parameter
+      if (!isGptImage1) {
+        requestParams.response_format =
+          responseFormat as OpenAI.Images.ImageGenerateParams["response_format"];
+      }
 
       if (params.quality) {
         requestParams.quality =
