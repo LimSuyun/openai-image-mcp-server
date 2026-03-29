@@ -227,7 +227,8 @@ const GenerateImageSchema = z
       .default(ResponseFormat.URL)
       .describe(
         "Return format. 'url' gives download links (valid ~60 min). " +
-          "'b64_json' embeds image data in the response."
+          "'b64_json' embeds image data in the response. " +
+          "Note: gpt-image-1 only supports 'b64_json' — 'url' will be ignored and overridden automatically."
       ),
     output_directory: z
       .string()
@@ -277,12 +278,16 @@ Examples:
   },
   async (params: GenerateImageInput) => {
     try {
+      // gpt-image-1 only supports b64_json
+      const responseFormat =
+        params.model === "gpt-image-1" ? ResponseFormat.B64_JSON : params.response_format;
+
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
         }
-        if (params.response_format !== ResponseFormat.B64_JSON) {
+        if (responseFormat !== ResponseFormat.B64_JSON) {
           return {
             isError: true,
             content: [
@@ -305,7 +310,7 @@ Examples:
         n: params.n,
         size: params.size as OpenAI.Images.ImageGenerateParams["size"],
         response_format:
-          params.response_format as OpenAI.Images.ImageGenerateParams["response_format"],
+          responseFormat as OpenAI.Images.ImageGenerateParams["response_format"],
       };
 
       if (params.quality) {
@@ -322,7 +327,7 @@ Examples:
 
       const { content, metadata } = collectImageContent(
         images,
-        params.response_format,
+        responseFormat,
         params.output_directory,
         "generated"
       );
@@ -451,6 +456,10 @@ Examples:
   },
   async (params: EditImageInput) => {
     try {
+      // gpt-image-1 only supports b64_json
+      const responseFormat =
+        params.model === "gpt-image-1" ? ResponseFormat.B64_JSON : params.response_format;
+
       if (!fs.existsSync(params.image_path)) {
         return {
           isError: true,
@@ -470,7 +479,7 @@ Examples:
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
         }
-        if (params.response_format !== ResponseFormat.B64_JSON) {
+        if (responseFormat !== ResponseFormat.B64_JSON) {
           return {
             isError: true,
             content: [
@@ -492,7 +501,7 @@ Examples:
         n: params.n,
         size: params.size as OpenAI.Images.ImageEditParams["size"],
         response_format:
-          params.response_format as OpenAI.Images.ImageEditParams["response_format"],
+          responseFormat as OpenAI.Images.ImageEditParams["response_format"],
       };
 
       if (params.mask_path) {
@@ -504,7 +513,7 @@ Examples:
 
       const { content, metadata } = collectImageContent(
         images,
-        params.response_format,
+        responseFormat,
         params.output_directory,
         "edited"
       );
