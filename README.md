@@ -26,7 +26,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "gpt-image-gen": {
       "command": "npx",
-      "args": ["-y", "openai-image-mcp-server"],
+      "args": ["-y", "openai-image-mcp-server@latest"],
       "env": {
         "OPENAI_API_KEY": "sk-..."
       }
@@ -44,7 +44,7 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
   "mcpServers": {
     "gpt-image-gen": {
       "command": "npx",
-      "args": ["-y", "openai-image-mcp-server"],
+      "args": ["-y", "openai-image-mcp-server@latest"],
       "env": {
         "OPENAI_API_KEY": "sk-..."
       }
@@ -62,7 +62,7 @@ Add to your VS Code `settings.json`:
   "mcp.servers": {
     "gpt-image-gen": {
       "command": "npx",
-      "args": ["-y", "openai-image-mcp-server"],
+      "args": ["-y", "openai-image-mcp-server@latest"],
       "env": {
         "OPENAI_API_KEY": "sk-..."
       }
@@ -92,7 +92,7 @@ Add to `~/.claude/settings.json`:
 Or via CLI:
 
 ```bash
-claude mcp add openai-image -e OPENAI_API_KEY=sk-... -- npx -y openai-image-mcp-server
+claude mcp add openai-image -e OPENAI_API_KEY=sk-... -- npx -y openai-image-mcp-server@latest
 ```
 
 ### Manual (from source)
@@ -158,7 +158,7 @@ Edit an existing image using a text prompt. Supports inpainting with an optional
 | `image_path` | string | required | Absolute path to source PNG (square, < 4 MB) |
 | `prompt` | string | required | Description of the desired edit |
 | `mask_path` | string | — | Absolute path to mask PNG (transparent = edit zone) |
-| `model` | `dall-e-2` \| `gpt-image-1` | `gpt-image-1` | Model to use |
+| `model` | `dall-e-2` | `dall-e-2` | Model to use (only dall-e-2 supports editing) |
 | `n` | number (1–10) | `1` | Number of results |
 | `size` | `256x256` \| `512x512` \| `1024x1024` | `1024x1024` | Output dimensions |
 | `response_format` | `url` \| `b64_json` | `url` | Return format |
@@ -200,7 +200,7 @@ Create 3 variations of /art/original.png
 | | DALL-E 2 | DALL-E 3 | gpt-image-1 |
 |---|---|---|---|
 | Generate | ✓ | ✓ | ✓ |
-| Edit | ✓ | ✗ | ✓ |
+| Edit | ✓ | ✗ | ✗ |
 | Variation | ✓ | ✗ | ✗ |
 | Max images (n) | 10 | 1 | 1 |
 | Style parameter | ✗ | ✓ | ✗ |
