@@ -12,6 +12,8 @@ import { z } from "zod";
 import OpenAI, { toFile } from "openai";
 import fs from "fs";
 import path from "path";
+import os from "os";
+import sharp from "sharp";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -99,6 +101,8 @@ function handleOpenAIError(error: unknown): string {
 // Shared helper: collect MCP content items from an OpenAI image response list
 // ---------------------------------------------------------------------------
 
+const MCP_INLINE_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB in base64 bytes (~3.75 MB raw)
+
 function collectImageContent(
   images: OpenAI.Image[],
   responseFormat: "url" | "b64_json",
@@ -117,17 +121,19 @@ function collectImageContent(
     }
 
     if (responseFormat === "b64_json" && img.b64_json) {
-      content.push({
-        type: "image",
-        data: img.b64_json,
-        mimeType: "image/png",
-      });
+      const saveDir = outputDirectory ?? os.tmpdir();
+      const filename = `${prefix}_${Date.now()}_${i + 1}.png`;
+      const filepath = path.join(saveDir, filename);
+      fs.writeFileSync(filepath, Buffer.from(img.b64_json, "base64"));
+      meta.saved_path = filepath;
 
-      if (outputDirectory) {
-        const filename = `${prefix}_${Date.now()}_${i + 1}.png`;
-        const filepath = path.join(outputDirectory, filename);
-        fs.writeFileSync(filepath, Buffer.from(img.b64_json, "base64"));
-        meta.saved_path = filepath;
+      // Only embed inline if small enough to avoid hitting MCP's 20 MB response limit
+      if (img.b64_json.length <= MCP_INLINE_SIZE_LIMIT) {
+        content.push({
+          type: "image",
+          data: img.b64_json,
+          mimeType: "image/png",
+        });
       }
     } else if (img.url) {
       meta.url = img.url;
@@ -151,6 +157,62 @@ function validateOutputDirectory(dir: string): string | null {
     return `Error: Output path is not a directory: ${dir}`;
   }
   return null;
+}
+
+/**
+ * If the image at `filePath` exceeds `maxBytes`, resizes it iteratively
+ * (reducing dimensions by 10% each pass) until it fits.
+ * Returns the path to use (original if no resize needed, temp file otherwise)
+ * and a log message describing what happened.
+ */
+async function resizeImageToFitLimit(
+  filePath: string,
+  maxBytes: number
+): Promise<{ resolvedPath: string; resizeNote: string | null }> {
+  const stats = fs.statSync(filePath);
+  if (stats.size <= maxBytes) {
+    return { resolvedPath: filePath, resizeNote: null };
+  }
+
+  const originalMB = (stats.size / (1024 * 1024)).toFixed(2);
+  const maxMB = (maxBytes / (1024 * 1024)).toFixed(0);
+
+  let image = sharp(filePath);
+  const meta = await image.metadata();
+  let width = meta.width ?? 1024;
+  let height = meta.height ?? 1024;
+
+  let tmpPath: string | null = null;
+  let attempts = 0;
+  const MAX_ATTEMPTS = 20;
+
+  while (attempts < MAX_ATTEMPTS) {
+    width = Math.round(width * 0.9);
+    height = Math.round(height * 0.9);
+    attempts++;
+
+    const resized = await sharp(filePath)
+      .resize(width, height)
+      .png({ compressionLevel: 9 })
+      .toBuffer();
+
+    if (resized.length <= maxBytes) {
+      tmpPath = path.join(os.tmpdir(), `mcp_resized_${Date.now()}.png`);
+      fs.writeFileSync(tmpPath, resized);
+      const newMB = (resized.length / (1024 * 1024)).toFixed(2);
+      return {
+        resolvedPath: tmpPath,
+        resizeNote:
+          `Note: Image was automatically resized from ${originalMB} MB to ${newMB} MB ` +
+          `(${width}x${height}) to meet the ${maxMB} MB API limit.`,
+      };
+    }
+  }
+
+  throw new Error(
+    `Unable to reduce image below ${maxMB} MB after ${MAX_ATTEMPTS} attempts. ` +
+      `Please provide a smaller image.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +439,8 @@ const EditImageSchema = z
       .min(1, "image_path is required")
       .describe(
         "Absolute path to the PNG image file to edit. " +
-          "Must be PNG format, square dimensions, and under 4 MB."
+          "Must be PNG format. Size limit: 4 MB for dall-e-2, 20 MB for gpt-image-1. " +
+          "Oversized images are automatically resized."
       ),
     prompt: z
       .string()
@@ -393,10 +456,12 @@ const EditImageSchema = z
           "If omitted the entire image is eligible for editing."
       ),
     model: z
-      .enum(["dall-e-2"])
-      .default("dall-e-2")
+      .enum(["dall-e-2", "gpt-image-1"])
+      .default("gpt-image-1")
       .describe(
-        "Model for editing. Only dall-e-2 supports image editing."
+        "Model for editing. " +
+          "'gpt-image-1' is the latest model (up to 20 MB input). " +
+          "'dall-e-2' supports masks and up to 10 images at once (up to 4 MB input)."
       ),
     n: z
       .number()
@@ -434,7 +499,7 @@ server.registerTool(
 Transparent areas in the mask indicate regions to edit. Without a mask, the model may edit the whole image.
 
 Args:
-  - image_path (string, required): Absolute path to PNG image (square, < 4 MB)
+  - image_path (string, required): Absolute path to PNG image. Size limit: 4 MB (dall-e-2) / 20 MB (gpt-image-1). Auto-resized if over limit.
   - prompt (string, required): Description of the desired edit. Max 1000 chars.
   - mask_path (string): Absolute path to PNG mask. Transparent pixels = edit zone. Optional.
   - model ('dall-e-2'|'gpt-image-1'): Model to use. Default: 'gpt-image-1'
@@ -467,11 +532,23 @@ Examples:
         };
       }
 
+      const fileSizeLimit = params.model === "gpt-image-1" ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
+
+      const { resolvedPath: resolvedImagePath, resizeNote: imageResizeNote } =
+        await resizeImageToFitLimit(params.image_path, fileSizeLimit);
+
       if (params.mask_path && !fs.existsSync(params.mask_path)) {
         return {
           isError: true,
           content: [{ type: "text" as const, text: `Error: Mask file not found: ${params.mask_path}` }],
         };
+      }
+
+      let resolvedMaskPath = params.mask_path;
+      let maskResizeNote: string | null = null;
+      if (params.mask_path) {
+        ({ resolvedPath: resolvedMaskPath, resizeNote: maskResizeNote } =
+          await resizeImageToFitLimit(params.mask_path, fileSizeLimit));
       }
 
       if (params.output_directory) {
@@ -493,10 +570,10 @@ Examples:
       }
 
       const client = getClient();
-      const imageName = path.basename(params.image_path);
+      const imageName = path.basename(resolvedImagePath);
 
       const requestParams: OpenAI.Images.ImageEditParams = {
-        image: await toFile(fs.createReadStream(params.image_path), imageName, { type: "image/png" }),
+        image: await toFile(fs.createReadStream(resolvedImagePath), imageName, { type: "image/png" }),
         prompt: params.prompt,
         model: params.model,
         n: params.n,
@@ -505,9 +582,9 @@ Examples:
           params.response_format as OpenAI.Images.ImageEditParams["response_format"],
       };
 
-      if (params.mask_path) {
-        const maskName = path.basename(params.mask_path);
-        requestParams.mask = await toFile(fs.createReadStream(params.mask_path), maskName, { type: "image/png" });
+      if (resolvedMaskPath) {
+        const maskName = path.basename(resolvedMaskPath);
+        requestParams.mask = await toFile(fs.createReadStream(resolvedMaskPath), maskName, { type: "image/png" });
       }
 
       const response = await client.images.edit(requestParams);
@@ -525,6 +602,8 @@ Examples:
         `Source: ${params.image_path}`,
         `Prompt: "${params.prompt}"`,
       ];
+      if (imageResizeNote) summaryLines.push(imageResizeNote);
+      if (maskResizeNote) summaryLines.push(maskResizeNote);
       for (const m of metadata) {
         summaryLines.push(`\nImage ${m.index}:`);
         if (m.url) summaryLines.push(`  URL: ${m.url}`);
@@ -624,6 +703,9 @@ Examples:
         };
       }
 
+      const { resolvedPath: resolvedImagePath, resizeNote } =
+        await resizeImageToFitLimit(params.image_path, 4 * 1024 * 1024);
+
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
         if (dirError) {
@@ -645,7 +727,7 @@ Examples:
       const client = getClient();
 
       const response = await client.images.createVariation({
-        image: fs.createReadStream(params.image_path),
+        image: fs.createReadStream(resolvedImagePath),
         n: params.n,
         size: params.size as OpenAI.Images.ImageCreateVariationParams["size"],
         response_format:
@@ -665,6 +747,7 @@ Examples:
         `Created ${images.length} variation(s) with dall-e-2`,
         `Source: ${params.image_path}`,
       ];
+      if (resizeNote) summaryLines.push(resizeNote);
       for (const m of metadata) {
         summaryLines.push(`\nVariation ${m.index}:`);
         if (m.url) summaryLines.push(`  URL: ${m.url}`);
