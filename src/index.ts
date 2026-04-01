@@ -102,6 +102,14 @@ function handleOpenAIError(error: unknown): string {
 // ---------------------------------------------------------------------------
 
 const MCP_INLINE_SIZE_LIMIT = 5 * 1024 * 1024; // 5 MB in base64 bytes (~3.75 MB raw)
+const DEFAULT_OUTPUT_DIR = path.join(process.cwd(), "openai-image-gen");
+
+function getDefaultOutputDir(): string {
+  if (!fs.existsSync(DEFAULT_OUTPUT_DIR)) {
+    fs.mkdirSync(DEFAULT_OUTPUT_DIR, { recursive: true });
+  }
+  return DEFAULT_OUTPUT_DIR;
+}
 
 function collectImageContent(
   images: OpenAI.Image[],
@@ -121,7 +129,7 @@ function collectImageContent(
     }
 
     if (responseFormat === "b64_json" && img.b64_json) {
-      const saveDir = outputDirectory ?? os.tmpdir();
+      const saveDir = outputDirectory ?? getDefaultOutputDir();
       const filename = `${prefix}_${Date.now()}_${i + 1}.png`;
       const filepath = path.join(saveDir, filename);
       fs.writeFileSync(filepath, Buffer.from(img.b64_json, "base64"));
