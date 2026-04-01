@@ -215,6 +215,24 @@ async function resizeImageToFitLimit(
   );
 }
 
+/**
+ * Ensures the image at `filePath` has an alpha channel (RGBA).
+ * Returns the original path if already RGBA, otherwise writes a converted temp file.
+ */
+async function ensureRGBA(filePath: string): Promise<{ resolvedPath: string; convertNote: string | null }> {
+  const meta = await sharp(filePath).metadata();
+  if (meta.channels === 4 && meta.hasAlpha) {
+    return { resolvedPath: filePath, convertNote: null };
+  }
+
+  const tmpPath = path.join(os.tmpdir(), `mcp_rgba_${Date.now()}.png`);
+  await sharp(filePath).ensureAlpha().png().toFile(tmpPath);
+  return {
+    resolvedPath: tmpPath,
+    convertNote: "Note: Image was automatically converted from RGB to RGBA (required by the edit API).",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
@@ -439,8 +457,8 @@ const EditImageSchema = z
       .min(1, "image_path is required")
       .describe(
         "Absolute path to the PNG image file to edit. " +
-          "Must be PNG format. Size limit: 4 MB for dall-e-2, 20 MB for gpt-image-1. " +
-          "Oversized images are automatically resized."
+          "Must be PNG format, under 4 MB. " +
+          "Oversized images are automatically resized. RGB images are auto-converted to RGBA."
       ),
     prompt: z
       .string()
@@ -456,13 +474,9 @@ const EditImageSchema = z
           "If omitted the entire image is eligible for editing."
       ),
     model: z
-      .enum(["dall-e-2", "gpt-image-1"])
-      .default("gpt-image-1")
-      .describe(
-        "Model for editing. " +
-          "'gpt-image-1' is the latest model (up to 20 MB input). " +
-          "'dall-e-2' supports masks and up to 10 images at once (up to 4 MB input)."
-      ),
+      .enum(["dall-e-2"])
+      .default("dall-e-2")
+      .describe("Model for editing. Only dall-e-2 supports image editing."),
     n: z
       .number()
       .int()
@@ -499,7 +513,7 @@ server.registerTool(
 Transparent areas in the mask indicate regions to edit. Without a mask, the model may edit the whole image.
 
 Args:
-  - image_path (string, required): Absolute path to PNG image. Size limit: 4 MB (dall-e-2) / 20 MB (gpt-image-1). Auto-resized if over limit.
+  - image_path (string, required): Absolute path to PNG image (< 4 MB). Auto-resized if over limit. RGB images are auto-converted to RGBA.
   - prompt (string, required): Description of the desired edit. Max 1000 chars.
   - mask_path (string): Absolute path to PNG mask. Transparent pixels = edit zone. Optional.
   - model ('dall-e-2'|'gpt-image-1'): Model to use. Default: 'gpt-image-1'
@@ -532,10 +546,8 @@ Examples:
         };
       }
 
-      const fileSizeLimit = params.model === "gpt-image-1" ? 20 * 1024 * 1024 : 4 * 1024 * 1024;
-
       const { resolvedPath: resolvedImagePath, resizeNote: imageResizeNote } =
-        await resizeImageToFitLimit(params.image_path, fileSizeLimit);
+        await resizeImageToFitLimit(params.image_path, 4 * 1024 * 1024);
 
       if (params.mask_path && !fs.existsSync(params.mask_path)) {
         return {
@@ -548,7 +560,7 @@ Examples:
       let maskResizeNote: string | null = null;
       if (params.mask_path) {
         ({ resolvedPath: resolvedMaskPath, resizeNote: maskResizeNote } =
-          await resizeImageToFitLimit(params.mask_path, fileSizeLimit));
+          await resizeImageToFitLimit(params.mask_path, 4 * 1024 * 1024));
       }
 
       if (params.output_directory) {
@@ -569,11 +581,21 @@ Examples:
         }
       }
 
+      const { resolvedPath: rgbaImagePath, convertNote: imageConvertNote } =
+        await ensureRGBA(resolvedImagePath);
+
+      let rgbaMaskPath = resolvedMaskPath;
+      let maskConvertNote: string | null = null;
+      if (resolvedMaskPath) {
+        ({ resolvedPath: rgbaMaskPath, convertNote: maskConvertNote } =
+          await ensureRGBA(resolvedMaskPath));
+      }
+
       const client = getClient();
-      const imageName = path.basename(resolvedImagePath);
+      const imageName = path.basename(rgbaImagePath);
 
       const requestParams: OpenAI.Images.ImageEditParams = {
-        image: await toFile(fs.createReadStream(resolvedImagePath), imageName, { type: "image/png" }),
+        image: await toFile(fs.createReadStream(rgbaImagePath), imageName, { type: "image/png" }),
         prompt: params.prompt,
         model: params.model,
         n: params.n,
@@ -582,9 +604,9 @@ Examples:
           params.response_format as OpenAI.Images.ImageEditParams["response_format"],
       };
 
-      if (resolvedMaskPath) {
-        const maskName = path.basename(resolvedMaskPath);
-        requestParams.mask = await toFile(fs.createReadStream(resolvedMaskPath), maskName, { type: "image/png" });
+      if (rgbaMaskPath) {
+        const maskName = path.basename(rgbaMaskPath);
+        requestParams.mask = await toFile(fs.createReadStream(rgbaMaskPath), maskName, { type: "image/png" });
       }
 
       const response = await client.images.edit(requestParams);
@@ -604,6 +626,8 @@ Examples:
       ];
       if (imageResizeNote) summaryLines.push(imageResizeNote);
       if (maskResizeNote) summaryLines.push(maskResizeNote);
+      if (imageConvertNote) summaryLines.push(imageConvertNote);
+      if (maskConvertNote) summaryLines.push(maskConvertNote);
       for (const m of metadata) {
         summaryLines.push(`\nImage ${m.index}:`);
         if (m.url) summaryLines.push(`  URL: ${m.url}`);
