@@ -2,3 +2,5 @@ src/
 .claude/
 *.map
 tsconfig.json
+test_output/
+*.mjs
