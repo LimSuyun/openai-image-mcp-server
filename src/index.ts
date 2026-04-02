@@ -802,6 +802,263 @@ Examples:
 );
 
 // ---------------------------------------------------------------------------
+// Tool 4: gpt_image_generate_sprite_sheet
+// ---------------------------------------------------------------------------
+
+/**
+ * Removes white/near-white background pixels by setting them transparent.
+ */
+async function removeWhiteBackground(
+  imagePath: string,
+  threshold: number
+): Promise<Buffer> {
+  const { data, info } = await sharp(imagePath)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = new Uint8Array(data);
+  for (let i = 0; i < pixels.length; i += 4) {
+    if (pixels[i] > threshold && pixels[i + 1] > threshold && pixels[i + 2] > threshold) {
+      pixels[i + 3] = 0;
+    }
+  }
+
+  return sharp(Buffer.from(pixels), {
+    raw: { width: info.width, height: info.height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Crops the image to the bounding box of non-transparent content.
+ */
+async function cropToContent(imageBuffer: Buffer): Promise<Buffer> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = new Uint8Array(data);
+  let minX = info.width, maxX = 0, minY = info.height, maxY = 0;
+
+  for (let y = 0; y < info.height; y++) {
+    for (let x = 0; x < info.width; x++) {
+      const idx = (y * info.width + x) * 4;
+      if (pixels[idx + 3] > 10) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (minX > maxX || minY > maxY) return imageBuffer;
+
+  return sharp(imageBuffer)
+    .extract({ left: minX, top: minY, width: maxX - minX + 1, height: maxY - minY + 1 })
+    .toBuffer();
+}
+
+const GenerateSpriteSheetSchema = z
+  .object({
+    character_description: z
+      .string()
+      .min(1)
+      .max(3000)
+      .describe(
+        "Description of the character's appearance (colors, clothing, accessories, art style). " +
+          "Be specific — this is used to generate 3 consistent walking-pose frames."
+      ),
+    output_path: z
+      .string()
+      .min(1)
+      .describe(
+        "Absolute path (including filename) where the final sprite sheet PNG will be saved. " +
+          "Example: '/project/assets/sprites/hero.png'"
+      ),
+    quality: z
+      .enum(["low", "medium", "high"])
+      .default("high")
+      .optional()
+      .describe("gpt-image-1 quality level. Default: 'high'"),
+    bg_threshold: z
+      .number()
+      .int()
+      .min(0)
+      .max(255)
+      .default(240)
+      .optional()
+      .describe(
+        "White background removal threshold (0–255). " +
+          "Higher values remove more of the background. Default: 240"
+      ),
+    frame_gap: z
+      .number()
+      .int()
+      .min(0)
+      .max(200)
+      .default(0)
+      .optional()
+      .describe("Gap in pixels between frames in the final sprite sheet. Default: 0"),
+  })
+  .strict();
+
+type GenerateSpriteSheetInput = z.infer<typeof GenerateSpriteSheetSchema>;
+
+const WALK_POSES = [
+  "walking pose: left leg stepping forward, body slightly leaning forward, right arm holding staff or weapon forward",
+  "walking pose: neutral upright stance, both feet close together, body straight",
+  "walking pose: right leg stepping forward, body slightly leaning forward, left arm swinging forward",
+];
+
+server.registerTool(
+  "gpt_image_generate_sprite_sheet",
+  {
+    title: "Generate Walking Sprite Sheet",
+    description: `Generate a 3-frame horizontal walking animation sprite sheet for a game character.
+
+Internally generates 3 individual frames using gpt-image-1, removes white backgrounds,
+crops each frame to content, aligns them to the same dimensions, then combines them
+side-by-side into a single transparent-background PNG.
+
+Args:
+  - character_description (string, required): Appearance of the character. Max 3000 chars.
+  - output_path (string, required): Absolute path for the output sprite sheet PNG.
+  - quality ('low'|'medium'|'high'): gpt-image-1 quality. Default: 'high'
+  - bg_threshold (number): White bg removal aggressiveness (0–255). Default: 240
+  - frame_gap (number): Pixel gap between frames. Default: 0
+
+Returns:
+  - Saved sprite sheet path and per-frame metadata
+
+Example:
+  - character_description="cute chibi alien commander, purple face, dark wizard robe with gold trim, teal orb staff"
+    output_path="/project/assets/sprites/alien-commander.png"`,
+    inputSchema: GenerateSpriteSheetSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params: GenerateSpriteSheetInput) => {
+    try {
+      const outputDir = path.dirname(params.output_path);
+      if (!fs.existsSync(outputDir)) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: Output directory does not exist: ${outputDir}` }],
+        };
+      }
+
+      const client = getClient();
+      const quality = params.quality ?? "high";
+      const bgThreshold = params.bg_threshold ?? 240;
+      const frameGap = params.frame_gap ?? 0;
+
+      // Generate 3 frames in parallel
+      const framePromises = WALK_POSES.map((pose, i) => {
+        const prompt =
+          `Single 2D game sprite character on pure white background. ` +
+          `Character: ${params.character_description}. ` +
+          `${pose}. ` +
+          `Full body visible and centered. Clean cartoon game sprite style with clear black outlines, ` +
+          `flat colors with soft shading. No ground shadow. No other characters.`;
+
+        return client.images
+          .generate({
+            prompt,
+            model: "gpt-image-1",
+            size: "1024x1024",
+            quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
+          })
+          .then((res) => ({ index: i, b64: res.data?.[0]?.b64_json ?? "" }));
+      });
+
+      const frameResults = await Promise.all(framePromises);
+
+      // Save raw frames to temp, remove bg, crop
+      const tmpDir = os.tmpdir();
+      const processedBuffers: Buffer[] = [];
+
+      for (const { index, b64 } of frameResults) {
+        if (!b64) {
+          return {
+            isError: true,
+            content: [{ type: "text" as const, text: `Error: Frame ${index + 1} returned empty data.` }],
+          };
+        }
+        const tmpPath = path.join(tmpDir, `sprite_frame_${Date.now()}_${index}.png`);
+        fs.writeFileSync(tmpPath, Buffer.from(b64, "base64"));
+
+        const noBg = await removeWhiteBackground(tmpPath, bgThreshold);
+        const cropped = await cropToContent(noBg);
+        processedBuffers.push(cropped);
+
+        fs.unlinkSync(tmpPath);
+      }
+
+      // Determine unified frame dimensions
+      const metaList = await Promise.all(
+        processedBuffers.map((buf) => sharp(buf).metadata())
+      );
+      const maxW = Math.max(...metaList.map((m) => m.width ?? 0));
+      const maxH = Math.max(...metaList.map((m) => m.height ?? 0));
+
+      // Pad each frame to maxW x maxH (center-aligned)
+      const paddedBuffers = await Promise.all(
+        processedBuffers.map(async (buf, i) => {
+          const w = metaList[i].width ?? maxW;
+          const h = metaList[i].height ?? maxH;
+          const left = Math.floor((maxW - w) / 2);
+          const top = Math.floor((maxH - h) / 2);
+          return sharp({
+            create: { width: maxW, height: maxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+          })
+            .png()
+            .composite([{ input: buf, left, top }])
+            .toBuffer();
+        })
+      );
+
+      // Combine frames horizontally
+      const totalWidth = maxW * 3 + frameGap * 2;
+      const compositeInputs = paddedBuffers.map((buf, i) => ({
+        input: buf,
+        left: i * (maxW + frameGap),
+        top: 0,
+      }));
+
+      await sharp({
+        create: { width: totalWidth, height: maxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+      })
+        .png()
+        .composite(compositeInputs)
+        .toFile(params.output_path);
+
+      const summaryLines = [
+        `Generated sprite sheet: ${params.output_path}`,
+        `Dimensions: ${totalWidth}x${maxH} (3 frames × ${maxW}x${maxH}, gap: ${frameGap}px)`,
+        `Model: gpt-image-1, Quality: ${quality}, BG threshold: ${bgThreshold}`,
+      ];
+
+      return {
+        content: [{ type: "text" as const, text: summaryLines.join("\n") }],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: handleOpenAIError(error) }],
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
