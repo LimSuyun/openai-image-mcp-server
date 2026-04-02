@@ -920,9 +920,11 @@ server.registerTool(
     title: "Generate Walking Sprite Sheet",
     description: `Generate a 3-frame horizontal walking animation sprite sheet for a game character.
 
-Internally generates 3 individual frames using gpt-image-1, removes white backgrounds,
-crops each frame to content, aligns them to the same dimensions, then combines them
-side-by-side into a single transparent-background PNG.
+Generates a neutral pose reference frame first, then uses the edit API to produce
+left-step and right-step frames from that reference, preserving face, outfit, and
+accessories consistently. Removes white backgrounds, crops each frame to content,
+aligns them to the same dimensions, then combines them side-by-side into a single
+transparent-background PNG.
 
 Args:
   - character_description (string, required): Appearance of the character. Max 3000 chars.
@@ -932,7 +934,7 @@ Args:
   - frame_gap (number): Pixel gap between frames. Default: 0
 
 Returns:
-  - Saved sprite sheet path and per-frame metadata
+  - Saved sprite sheet path and dimensions
 
 Example:
   - character_description="cute chibi alien commander, purple face, dark wizard robe with gold trim, teal orb staff"
@@ -959,85 +961,103 @@ Example:
       const quality = params.quality ?? "high";
       const bgThreshold = params.bg_threshold ?? 240;
       const frameGap = params.frame_gap ?? 0;
-
-      // Generate 3 frames in parallel
-      const framePromises = WALK_POSES.map((pose, i) => {
-        const prompt =
-          `Single 2D game sprite character on pure white background. ` +
-          `Character: ${params.character_description}. ` +
-          `${pose}. ` +
-          `Full body visible and centered. Clean cartoon game sprite style with clear black outlines, ` +
-          `flat colors with soft shading. No ground shadow. No other characters.`;
-
-        return client.images
-          .generate({
-            prompt,
-            model: "gpt-image-1",
-            size: "1024x1024",
-            quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
-          })
-          .then((res) => ({ index: i, b64: res.data?.[0]?.b64_json ?? "" }));
-      });
-
-      const frameResults = await Promise.all(framePromises);
-
-      // Save raw frames to temp, remove bg, crop
       const tmpDir = os.tmpdir();
-      const processedBuffers: Buffer[] = [];
 
-      for (const { index, b64 } of frameResults) {
+      // Step 1: Generate neutral pose as reference frame
+      const refPrompt =
+        `A single 2D game character sprite on a pure white background. ` +
+        `Character: ${params.character_description}. ` +
+        `${WALK_POSES[1]}. ` +
+        `Full body completely visible — top of hat/hood down to feet, weapon tip, all accessories. ` +
+        `Character occupies center 55% of image height with generous white margin on all sides. ` +
+        `Clean cartoon style, clear black outlines, flat colors, soft shading. No shadows.`;
+
+      const refResponse = await client.images.generate({
+        prompt: refPrompt,
+        model: "gpt-image-1",
+        size: "1024x1024",
+        quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
+      });
+      const refB64 = refResponse.data?.[0]?.b64_json ?? "";
+      if (!refB64) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: Reference frame returned empty data." }],
+        };
+      }
+      const refPath = path.join(tmpDir, `sprite_ref_${Date.now()}.png`);
+      fs.writeFileSync(refPath, Buffer.from(refB64, "base64"));
+
+      // Step 2: Edit reference → frame 1 (left step) and frame 3 (right step)
+      const editJobs = [
+        { poseIndex: 0, pose: WALK_POSES[0] },
+        { poseIndex: 2, pose: WALK_POSES[2] },
+      ];
+
+      const frameB64s: Record<number, string> = { 1: refB64 };
+
+      for (const { poseIndex, pose } of editJobs) {
+        const editPrompt =
+          `Redraw this exact character with a different walking pose: ${pose}. ` +
+          `Preserve every visual detail exactly as shown in the reference image: ` +
+          `same face, same outfit, same colors, same accessories, same weapon. ` +
+          `Reference description: ${params.character_description}. ` +
+          `Same chibi cartoon art style, same proportions, same outline thickness. ` +
+          `Pure white background. Full body visible including weapon tip and feet.`;
+
+        const editResponse = await client.images.edit({
+          image: await toFile(fs.createReadStream(refPath), "reference.png", { type: "image/png" }),
+          prompt: editPrompt,
+          model: "gpt-image-1",
+          size: "1024x1024",
+        });
+        const b64 = editResponse.data?.[0]?.b64_json ?? "";
         if (!b64) {
           return {
             isError: true,
-            content: [{ type: "text" as const, text: `Error: Frame ${index + 1} returned empty data.` }],
+            content: [{ type: "text" as const, text: `Error: Frame ${poseIndex + 1} edit returned empty data.` }],
           };
         }
-        const tmpPath = path.join(tmpDir, `sprite_frame_${Date.now()}_${index}.png`);
-        fs.writeFileSync(tmpPath, Buffer.from(b64, "base64"));
+        frameB64s[poseIndex] = b64;
+      }
 
+      fs.unlinkSync(refPath);
+
+      // Step 3: Process all 3 frames — remove bg, crop
+      const processedBuffers: Buffer[] = [];
+      for (let i = 0; i < 3; i++) {
+        const tmpPath = path.join(tmpDir, `sprite_frame_${Date.now()}_${i}.png`);
+        fs.writeFileSync(tmpPath, Buffer.from(frameB64s[i], "base64"));
         const noBg = await removeWhiteBackground(tmpPath, bgThreshold);
         const cropped = await cropToContent(noBg);
         processedBuffers.push(cropped);
-
         fs.unlinkSync(tmpPath);
       }
 
-      // Determine unified frame dimensions
-      const metaList = await Promise.all(
-        processedBuffers.map((buf) => sharp(buf).metadata())
-      );
+      // Step 4: Pad all frames to same size and combine horizontally
+      const metaList = await Promise.all(processedBuffers.map((buf) => sharp(buf).metadata()));
       const maxW = Math.max(...metaList.map((m) => m.width ?? 0));
       const maxH = Math.max(...metaList.map((m) => m.height ?? 0));
 
-      // Pad each frame to maxW x maxH (center-aligned)
       const paddedBuffers = await Promise.all(
         processedBuffers.map(async (buf, i) => {
           const w = metaList[i].width ?? maxW;
           const h = metaList[i].height ?? maxH;
-          const left = Math.floor((maxW - w) / 2);
-          const top = Math.floor((maxH - h) / 2);
           return sharp({
             create: { width: maxW, height: maxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
           })
             .png()
-            .composite([{ input: buf, left, top }])
+            .composite([{ input: buf, left: Math.floor((maxW - w) / 2), top: Math.floor((maxH - h) / 2) }])
             .toBuffer();
         })
       );
 
-      // Combine frames horizontally
       const totalWidth = maxW * 3 + frameGap * 2;
-      const compositeInputs = paddedBuffers.map((buf, i) => ({
-        input: buf,
-        left: i * (maxW + frameGap),
-        top: 0,
-      }));
-
       await sharp({
         create: { width: totalWidth, height: maxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
       })
         .png()
-        .composite(compositeInputs)
+        .composite(paddedBuffers.map((buf, i) => ({ input: buf, left: i * (maxW + frameGap), top: 0 })))
         .toFile(params.output_path);
 
       const summaryLines = [

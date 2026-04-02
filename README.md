@@ -212,11 +212,12 @@ Generate a 3-frame horizontal walking animation sprite sheet for a game characte
 
 **How it works:**
 
-1. Generates 3 poses in parallel: left-foot step → neutral → right-foot step
-2. Removes white/near-white background pixels (controlled by `bg_threshold`)
-3. Crops each frame to its non-transparent bounding box
-4. Pads all frames to the same dimensions (center-aligned)
-5. Composites frames horizontally into a single PNG
+1. Generates a neutral pose reference frame with `gpt-image-1`
+2. Uses the edit API with the reference image to produce left-step and right-step frames, preserving face, outfit, and accessories
+3. Removes white/near-white background pixels (controlled by `bg_threshold`)
+4. Crops each frame to its non-transparent bounding box
+5. Pads all frames to the same dimensions (center-aligned)
+6. Composites frames horizontally into a single PNG
 
 **Output:** A single PNG with dimensions `(frameWidth × 3 + frameGap × 2) × frameHeight`.
 
