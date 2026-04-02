@@ -9,7 +9,9 @@ An MCP server for OpenAI image generation. Generate, edit, and create variations
 | `gpt_image_generate` | Generate images from a text prompt |
 | `gpt_image_edit` | Edit an existing image with inpainting/masking |
 | `gpt_image_create_variation` | Create stylistic variations of an image (DALL-E 2) |
-| `gpt_image_generate_sprite_sheet` | Generate a 3-frame walking animation sprite sheet for a game character |
+| `gpt_image_create_character_reference` | Generate a base reference image for a game character |
+| `gpt_image_generate_pose` | Generate any pose/action from a character reference image |
+| `gpt_image_generate_sprite_sheet` | Generate a multi-frame sprite sheet (convenience wrapper) |
 
 ## Requirements
 
@@ -198,42 +200,84 @@ Create 3 variations of /art/original.png
 
 ---
 
-### `gpt_image_generate_sprite_sheet`
+### `gpt_image_create_character_reference`
 
-Generate a 3-frame horizontal walking animation sprite sheet for a game character. Internally generates each frame with `gpt-image-1`, removes the white background, crops to content, aligns frames to a uniform size, and combines them side-by-side into a single transparent-background PNG.
+Generate a base reference image for a game character on a transparent background. Use this as the first step before generating any poses.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `character_description` | string | required | Appearance of the character (colors, clothing, art style). Max 3000 chars. |
-| `output_path` | string | required | Absolute path (including filename) for the output PNG |
+| `character_description` | string | required | Full appearance description. Max 3000 chars. |
+| `output_path` | string | required | Absolute path for the output PNG |
 | `quality` | `low` \| `medium` \| `high` | `high` | gpt-image-1 quality level |
-| `bg_threshold` | number (0–255) | `240` | White background removal aggressiveness — higher removes more |
-| `frame_gap` | number | `0` | Pixel gap between frames in the final sheet |
+| `bg_threshold` | number (0–255) | `240` | Background removal threshold |
+
+**Example:**
+
+```
+Create a character reference for a cute chibi goose
+  → character_description: "cute chibi goose, white feathers, orange beak, blue sailor hat, red bow tie"
+     output_path: /project/assets/sprites/goose_ref.png
+```
+
+---
+
+### `gpt_image_generate_pose`
+
+Generate a specific pose or action frame using a reference image for visual consistency.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `reference_image_path` | string | required | Path to reference PNG from `gpt_image_create_character_reference` |
+| `character_description` | string | required | Same description used for the reference |
+| `pose_description` | string | required | Free-text pose or action. Max 1000 chars. |
+| `output_path` | string | required | Absolute path for the output PNG |
+| `quality` | `low` \| `medium` \| `high` | `high` | gpt-image-1 quality level |
+| `bg_threshold` | number (0–255) | `240` | Background removal threshold |
+
+**Example poses:**
+- `"walking with left foot forward"`
+- `"crying, tears streaming down face"`
+- `"jumping with both arms raised"`
+- `"attacking, swinging sword to the right"`
+- `"sitting cross-legged"`
+- `"waving hello"`
+
+---
+
+### `gpt_image_generate_sprite_sheet`
+
+Convenience wrapper: generates a reference internally, then produces all requested poses and assembles them into a single sprite sheet. For more control, use `gpt_image_create_character_reference` + `gpt_image_generate_pose` directly.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `character_description` | string | required | Appearance of the character. Max 3000 chars. |
+| `poses` | string[] | 3-frame walk cycle | List of pose descriptions for each frame |
+| `output_path` | string | required | Absolute path for the output sprite sheet PNG |
+| `quality` | `low` \| `medium` \| `high` | `high` | gpt-image-1 quality level |
+| `bg_threshold` | number (0–255) | `240` | Background removal threshold |
+| `frame_gap` | number | `0` | Pixel gap between frames |
 
 **How it works:**
 
-1. Generates a neutral pose reference frame with `gpt-image-1`
-2. Uses the edit API with the reference image to produce left-step and right-step frames, preserving face, outfit, and accessories
-3. Removes white/near-white background pixels (controlled by `bg_threshold`)
-4. Crops each frame to its non-transparent bounding box
-5. Pads all frames to the same dimensions (center-aligned)
-6. Composites frames horizontally into a single PNG
-
-**Output:** A single PNG with dimensions `(frameWidth × 3 + frameGap × 2) × frameHeight`.
+1. Generates a neutral reference frame with `gpt-image-1`
+2. Uses the edit API with the reference to generate each requested pose
+3. Removes background (flood-fill from edges, preserves white character parts)
+4. Crops each frame to content and pads to uniform dimensions
+5. Composites all frames horizontally into a single transparent PNG
 
 **Examples:**
 
 ```
-Generate a sprite sheet for a cute chibi alien commander
-  → character_description: "cute chibi alien commander, purple face, dark wizard robe with gold trim, teal orb staff"
-     output_path: /project/assets/sprites/alien-commander.png
+3-frame walk cycle (default)
+  → character_description: "chibi knight in silver armor with red cape"
+     output_path: /sprites/knight_walk.png
 ```
 
 ```
-Generate a sprite sheet with extra spacing between frames
-  → character_description: "medieval knight in silver armor with red cape"
-     output_path: /game/sprites/knight.png
-     frame_gap: 8
+Custom poses
+  → character_description: "cute chibi goose, white feathers, blue sailor hat, red bow tie"
+     poses: ["walking left foot forward", "waving hello", "sitting down"]
+     output_path: /sprites/goose_actions.png
 ```
 
 ```

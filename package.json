@@ -1,6 +1,6 @@
 {
   "name": "openai-image-mcp-server",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "MCP server for OpenAI image generation (DALL-E 2, DALL-E 3, gpt-image-1)",
   "type": "module",
   "main": "dist/index.js",

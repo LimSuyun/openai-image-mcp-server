@@ -802,11 +802,13 @@ Examples:
 );
 
 // ---------------------------------------------------------------------------
-// Tool 4: gpt_image_generate_sprite_sheet
+// Tools 4–6: Character reference + pose generation + sprite sheet
 // ---------------------------------------------------------------------------
 
 /**
- * Removes white/near-white background pixels by setting them transparent.
+ * Removes white/near-white background pixels using flood-fill from image corners.
+ * Only background pixels reachable from the edges are made transparent,
+ * preserving white areas that are part of the character itself.
  */
 async function removeWhiteBackground(
   imagePath: string,
@@ -818,14 +820,47 @@ async function removeWhiteBackground(
     .toBuffer({ resolveWithObject: true });
 
   const pixels = new Uint8Array(data);
-  for (let i = 0; i < pixels.length; i += 4) {
-    if (pixels[i] > threshold && pixels[i + 1] > threshold && pixels[i + 2] > threshold) {
-      pixels[i + 3] = 0;
+  const { width, height } = info;
+  const visited = new Uint8Array(width * height);
+
+  const isWhite = (x: number, y: number): boolean => {
+    const idx = (y * width + x) * 4;
+    return pixels[idx] > threshold && pixels[idx + 1] > threshold && pixels[idx + 2] > threshold;
+  };
+
+  // BFS flood-fill from all edge pixels
+  const queue: number[] = [];
+  const enqueue = (x: number, y: number) => {
+    if (x < 0 || x >= width || y < 0 || y >= height) return;
+    const pos = y * width + x;
+    if (visited[pos] || !isWhite(x, y)) return;
+    visited[pos] = 1;
+    queue.push(x, y);
+  };
+
+  for (let x = 0; x < width; x++) { enqueue(x, 0); enqueue(x, height - 1); }
+  for (let y = 0; y < height; y++) { enqueue(0, y); enqueue(width - 1, y); }
+
+  let qi = 0;
+  while (qi < queue.length) {
+    const x = queue[qi++];
+    const y = queue[qi++];
+    enqueue(x + 1, y); enqueue(x - 1, y);
+    enqueue(x, y + 1); enqueue(x, y - 1);
+  }
+
+  // Make only the flood-filled (background) pixels transparent
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (visited[y * width + x]) {
+        const idx = (y * width + x) * 4;
+        pixels[idx + 3] = 0;
+      }
     }
   }
 
   return sharp(Buffer.from(pixels), {
-    raw: { width: info.width, height: info.height, channels: 4 },
+    raw: { width, height, channels: 4 },
   })
     .png()
     .toBuffer();
@@ -862,22 +897,77 @@ async function cropToContent(imageBuffer: Buffer): Promise<Buffer> {
     .toBuffer();
 }
 
-const GenerateSpriteSheetSchema = z
+// ---------------------------------------------------------------------------
+// Shared helper: generate a pose from a reference image (b64)
+// ---------------------------------------------------------------------------
+
+async function generatePoseFromReference(
+  client: OpenAI,
+  referenceB64: string,
+  poseDescription: string,
+  characterDescription: string,
+  quality: string,
+  tmpDir: string
+): Promise<string> {
+  const srcPath = path.join(tmpDir, `pose_src_${Date.now()}.png`);
+  fs.writeFileSync(srcPath, Buffer.from(referenceB64, "base64"));
+
+  const editPrompt =
+    `Redraw this exact character in the following pose or action: ${poseDescription}. ` +
+    `Preserve every visual detail from the reference image exactly — ` +
+    `same face, same body shape and proportions, same outfit and colors, same accessories and items. ` +
+    `Only the pose or action changes. Nothing is added or removed. ` +
+    `Character description for reference: ${characterDescription}. ` +
+    `Pure white background. Full body visible including all accessories.`;
+
+  const response = await client.images.edit({
+    image: await toFile(fs.createReadStream(srcPath), "reference.png", { type: "image/png" }),
+    prompt: editPrompt,
+    model: "gpt-image-1",
+    size: "1024x1024",
+  });
+
+  fs.unlinkSync(srcPath);
+  return response.data?.[0]?.b64_json ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper: process a raw b64 image → remove bg → crop → Buffer
+// ---------------------------------------------------------------------------
+
+async function processFrame(
+  b64: string,
+  bgThreshold: number,
+  tmpDir: string
+): Promise<Buffer> {
+  const tmpPath = path.join(tmpDir, `frame_${Date.now()}.png`);
+  fs.writeFileSync(tmpPath, Buffer.from(b64, "base64"));
+  const noBg = await removeWhiteBackground(tmpPath, bgThreshold);
+  const cropped = await cropToContent(noBg);
+  fs.unlinkSync(tmpPath);
+  return cropped;
+}
+
+// ---------------------------------------------------------------------------
+// Tool 4: gpt_image_create_character_reference
+// ---------------------------------------------------------------------------
+
+const CreateCharacterReferenceSchema = z
   .object({
     character_description: z
       .string()
       .min(1)
       .max(3000)
       .describe(
-        "Description of the character's appearance (colors, clothing, accessories, art style). " +
-          "Be specific — this is used to generate 3 consistent walking-pose frames."
+        "Description of the character's appearance — colors, clothing, accessories, art style. " +
+          "Be as specific as possible. This image will be used as the visual reference for all future poses."
       ),
     output_path: z
       .string()
       .min(1)
       .describe(
-        "Absolute path (including filename) where the final sprite sheet PNG will be saved. " +
-          "Example: '/project/assets/sprites/hero.png'"
+        "Absolute path (including filename) where the reference PNG will be saved. " +
+          "Example: '/project/assets/sprites/hero_ref.png'"
       ),
     quality: z
       .enum(["low", "medium", "high"])
@@ -891,10 +981,283 @@ const GenerateSpriteSheetSchema = z
       .max(255)
       .default(240)
       .optional()
+      .describe("White background removal threshold (0–255). Default: 240"),
+  })
+  .strict();
+
+type CreateCharacterReferenceInput = z.infer<typeof CreateCharacterReferenceSchema>;
+
+server.registerTool(
+  "gpt_image_create_character_reference",
+  {
+    title: "Create Character Reference",
+    description: `Generate a base reference image for a game character on a transparent background.
+
+This is the first step in a two-step workflow:
+  1. gpt_image_create_character_reference — create the base character (this tool)
+  2. gpt_image_generate_pose — generate any pose using the reference
+
+The reference image is a front-facing neutral stance. Save it and use its path
+with gpt_image_generate_pose to create consistent walking, attacking, crying,
+jumping, or any other animation frames.
+
+Args:
+  - character_description (string, required): Full appearance description. Max 3000 chars.
+  - output_path (string, required): Absolute path for the output PNG.
+  - quality ('low'|'medium'|'high'): gpt-image-1 quality. Default: 'high'
+  - bg_threshold (number): Background removal threshold (0–255). Default: 240
+
+Returns:
+  - Saved reference image path
+
+Example:
+  - character_description="cute chibi goose, white feathers, orange beak, blue sailor hat, red bow tie"
+    output_path="/project/assets/sprites/goose_ref.png"`,
+    inputSchema: CreateCharacterReferenceSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params: CreateCharacterReferenceInput) => {
+    try {
+      const outputDir = path.dirname(params.output_path);
+      if (!fs.existsSync(outputDir)) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: Output directory does not exist: ${outputDir}` }],
+        };
+      }
+
+      const client = getClient();
+      const quality = params.quality ?? "high";
+      const bgThreshold = params.bg_threshold ?? 240;
+      const tmpDir = os.tmpdir();
+
+      const prompt =
+        `A single 2D game character sprite on a pure white background. ` +
+        `Character: ${params.character_description}. ` +
+        `Neutral front-facing stance, body relaxed, arms at sides. ` +
+        `Full body completely visible — top of head to feet, all accessories included. ` +
+        `Character occupies center 60% of image height with generous white margin on all sides. ` +
+        `Clean cartoon style, clear black outlines, flat colors, soft shading. No shadows.`;
+
+      const response = await client.images.generate({
+        prompt,
+        model: "gpt-image-1",
+        size: "1024x1024",
+        quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
+      });
+
+      const b64 = response.data?.[0]?.b64_json ?? "";
+      if (!b64) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: Image generation returned empty data." }],
+        };
+      }
+
+      const processed = await processFrame(b64, bgThreshold, tmpDir);
+      fs.writeFileSync(params.output_path, processed);
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Character reference saved: ${params.output_path}\nUse this path with gpt_image_generate_pose to create any pose.`,
+          },
+          { type: "image" as const, data: b64, mimeType: "image/png" },
+        ],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: handleOpenAIError(error) }],
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool 5: gpt_image_generate_pose
+// ---------------------------------------------------------------------------
+
+const GeneratePoseSchema = z
+  .object({
+    reference_image_path: z
+      .string()
+      .min(1)
       .describe(
-        "White background removal threshold (0–255). " +
-          "Higher values remove more of the background. Default: 240"
+        "Absolute path to the character reference PNG (created by gpt_image_create_character_reference). " +
+          "This image is used to maintain visual consistency."
       ),
+    character_description: z
+      .string()
+      .min(1)
+      .max(3000)
+      .describe(
+        "The same character description used when creating the reference. " +
+          "Helps the model preserve appearance details."
+      ),
+    pose_description: z
+      .string()
+      .min(1)
+      .max(1000)
+      .describe(
+        "Free-text description of the pose or action to generate. " +
+          "Examples: 'walking, left foot forward', 'crying with tears', 'jumping with arms raised', " +
+          "'attacking with sword', 'sitting cross-legged', 'waving hello'"
+      ),
+    output_path: z
+      .string()
+      .min(1)
+      .describe("Absolute path (including filename) where the pose PNG will be saved."),
+    quality: z
+      .enum(["low", "medium", "high"])
+      .default("high")
+      .optional()
+      .describe("gpt-image-1 quality level. Default: 'high'"),
+    bg_threshold: z
+      .number()
+      .int()
+      .min(0)
+      .max(255)
+      .default(240)
+      .optional()
+      .describe("White background removal threshold (0–255). Default: 240"),
+  })
+  .strict();
+
+type GeneratePoseInput = z.infer<typeof GeneratePoseSchema>;
+
+server.registerTool(
+  "gpt_image_generate_pose",
+  {
+    title: "Generate Character Pose",
+    description: `Generate a specific pose or action frame for a character, using a reference image for visual consistency.
+
+Use this after gpt_image_create_character_reference to create any animation frames:
+walking, running, jumping, attacking, crying, waving, sitting, etc.
+
+Args:
+  - reference_image_path (string, required): Path to the reference PNG from gpt_image_create_character_reference.
+  - character_description (string, required): Same description used for the reference.
+  - pose_description (string, required): Free-text pose or action. Max 1000 chars.
+  - output_path (string, required): Absolute path for the output PNG.
+  - quality ('low'|'medium'|'high'): gpt-image-1 quality. Default: 'high'
+  - bg_threshold (number): Background removal threshold (0–255). Default: 240
+
+Returns:
+  - Saved pose image path and inline preview
+
+Examples:
+  - pose_description="walking with left foot forward"
+  - pose_description="crying, tears streaming down face, eyes closed"
+  - pose_description="jumping high with both arms raised in celebration"
+  - pose_description="attacking, swinging sword to the right"`,
+    inputSchema: GeneratePoseSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params: GeneratePoseInput) => {
+    try {
+      if (!fs.existsSync(params.reference_image_path)) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: Reference image not found: ${params.reference_image_path}` }],
+        };
+      }
+      const outputDir = path.dirname(params.output_path);
+      if (!fs.existsSync(outputDir)) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `Error: Output directory does not exist: ${outputDir}` }],
+        };
+      }
+
+      const client = getClient();
+      const quality = params.quality ?? "high";
+      const bgThreshold = params.bg_threshold ?? 240;
+      const tmpDir = os.tmpdir();
+
+      const refB64 = fs.readFileSync(params.reference_image_path).toString("base64");
+      const b64 = await generatePoseFromReference(
+        client, refB64, params.pose_description,
+        params.character_description, quality, tmpDir
+      );
+      if (!b64) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: "Error: Pose generation returned empty data." }],
+        };
+      }
+
+      const processed = await processFrame(b64, bgThreshold, tmpDir);
+      fs.writeFileSync(params.output_path, processed);
+
+      return {
+        content: [
+          { type: "text" as const, text: `Pose saved: ${params.output_path}` },
+          { type: "image" as const, data: b64, mimeType: "image/png" },
+        ],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: handleOpenAIError(error) }],
+      };
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool 6: gpt_image_generate_sprite_sheet
+// ---------------------------------------------------------------------------
+
+const GenerateSpriteSheetSchema = z
+  .object({
+    character_description: z
+      .string()
+      .min(1)
+      .max(3000)
+      .describe(
+        "Description of the character's appearance. Be specific — used to generate the reference and all pose frames."
+      ),
+    poses: z
+      .array(z.string().min(1).max(500))
+      .min(1)
+      .max(10)
+      .optional()
+      .describe(
+        "List of pose descriptions for each frame. " +
+          "Defaults to a 3-frame walk cycle if omitted. " +
+          "Examples: ['walking left foot forward', 'neutral stance', 'walking right foot forward']"
+      ),
+    output_path: z
+      .string()
+      .min(1)
+      .describe(
+        "Absolute path (including filename) where the final sprite sheet PNG will be saved."
+      ),
+    quality: z
+      .enum(["low", "medium", "high"])
+      .default("high")
+      .optional()
+      .describe("gpt-image-1 quality level. Default: 'high'"),
+    bg_threshold: z
+      .number()
+      .int()
+      .min(0)
+      .max(255)
+      .default(240)
+      .optional()
+      .describe("White background removal threshold (0–255). Default: 240"),
     frame_gap: z
       .number()
       .int()
@@ -902,43 +1265,52 @@ const GenerateSpriteSheetSchema = z
       .max(200)
       .default(0)
       .optional()
-      .describe("Gap in pixels between frames in the final sprite sheet. Default: 0"),
+      .describe("Gap in pixels between frames. Default: 0"),
   })
   .strict();
 
 type GenerateSpriteSheetInput = z.infer<typeof GenerateSpriteSheetSchema>;
 
-const WALK_POSES = [
-  "walking pose: left leg stepping forward, body slightly leaning forward, right arm holding staff or weapon forward",
-  "walking pose: neutral upright stance, both feet close together, body straight",
-  "walking pose: right leg stepping forward, body slightly leaning forward, left arm swinging forward",
+const DEFAULT_WALK_POSES = [
+  "walking, left foot stepping forward, mid-stride",
+  "neutral upright stance, both feet together",
+  "walking, right foot stepping forward, mid-stride",
 ];
 
 server.registerTool(
   "gpt_image_generate_sprite_sheet",
   {
-    title: "Generate Walking Sprite Sheet",
-    description: `Generate a 3-frame horizontal walking animation sprite sheet for a game character.
+    title: "Generate Sprite Sheet",
+    description: `Generate a multi-frame sprite sheet for a game character.
 
-Generates a neutral pose reference frame first, then uses the edit API to produce
-left-step and right-step frames from that reference, preserving face, outfit, and
-accessories consistently. Removes white backgrounds, crops each frame to content,
-aligns them to the same dimensions, then combines them side-by-side into a single
-transparent-background PNG.
+Internally creates a reference image from the character description, then generates
+each requested pose using that reference for visual consistency. Frames are combined
+side-by-side into a single transparent-background PNG.
+
+For more control, use the two-step workflow instead:
+  1. gpt_image_create_character_reference
+  2. gpt_image_generate_pose (called once per frame)
 
 Args:
   - character_description (string, required): Appearance of the character. Max 3000 chars.
+  - poses (string[]): Pose descriptions for each frame. Defaults to a 3-frame walk cycle.
   - output_path (string, required): Absolute path for the output sprite sheet PNG.
   - quality ('low'|'medium'|'high'): gpt-image-1 quality. Default: 'high'
-  - bg_threshold (number): White bg removal aggressiveness (0–255). Default: 240
+  - bg_threshold (number): Background removal threshold (0–255). Default: 240
   - frame_gap (number): Pixel gap between frames. Default: 0
 
 Returns:
   - Saved sprite sheet path and dimensions
 
-Example:
-  - character_description="cute chibi alien commander, purple face, dark wizard robe with gold trim, teal orb staff"
-    output_path="/project/assets/sprites/alien-commander.png"`,
+Examples:
+  - 3-frame walk cycle (default):
+      character_description="chibi knight in silver armor"
+      output_path="/sprites/knight_walk.png"
+
+  - Custom poses:
+      character_description="cute goose with sailor hat"
+      poses=["walking left foot forward", "waving hello with right wing", "sitting"]
+      output_path="/sprites/goose_actions.png"`,
     inputSchema: GenerateSpriteSheetSchema,
     annotations: {
       readOnlyHint: false,
@@ -961,15 +1333,16 @@ Example:
       const quality = params.quality ?? "high";
       const bgThreshold = params.bg_threshold ?? 240;
       const frameGap = params.frame_gap ?? 0;
+      const poses = params.poses ?? DEFAULT_WALK_POSES;
       const tmpDir = os.tmpdir();
 
-      // Step 1: Generate neutral pose as reference frame
+      // Step 1: Generate reference
       const refPrompt =
         `A single 2D game character sprite on a pure white background. ` +
         `Character: ${params.character_description}. ` +
-        `${WALK_POSES[1]}. ` +
-        `Full body completely visible — top of hat/hood down to feet, weapon tip, all accessories. ` +
-        `Character occupies center 55% of image height with generous white margin on all sides. ` +
+        `Neutral front-facing stance, body relaxed, arms at sides. ` +
+        `Full body completely visible — top of head to feet, all accessories included. ` +
+        `Character occupies center 60% of image height with generous white margin on all sides. ` +
         `Clean cartoon style, clear black outlines, flat colors, soft shading. No shadows.`;
 
       const refResponse = await client.images.generate({
@@ -985,56 +1358,23 @@ Example:
           content: [{ type: "text" as const, text: "Error: Reference frame returned empty data." }],
         };
       }
-      const refPath = path.join(tmpDir, `sprite_ref_${Date.now()}.png`);
-      fs.writeFileSync(refPath, Buffer.from(refB64, "base64"));
 
-      // Step 2: Edit reference → frame 1 (left step) and frame 3 (right step)
-      const editJobs = [
-        { poseIndex: 0, pose: WALK_POSES[0] },
-        { poseIndex: 2, pose: WALK_POSES[2] },
-      ];
-
-      const frameB64s: Record<number, string> = { 1: refB64 };
-
-      for (const { poseIndex, pose } of editJobs) {
-        const editPrompt =
-          `Redraw this exact character with a different walking pose: ${pose}. ` +
-          `Preserve every visual detail exactly as shown in the reference image: ` +
-          `same face, same outfit, same colors, same accessories, same weapon. ` +
-          `Reference description: ${params.character_description}. ` +
-          `Same chibi cartoon art style, same proportions, same outline thickness. ` +
-          `Pure white background. Full body visible including weapon tip and feet.`;
-
-        const editResponse = await client.images.edit({
-          image: await toFile(fs.createReadStream(refPath), "reference.png", { type: "image/png" }),
-          prompt: editPrompt,
-          model: "gpt-image-1",
-          size: "1024x1024",
-        });
-        const b64 = editResponse.data?.[0]?.b64_json ?? "";
+      // Step 2: Generate each pose from the reference
+      const processedBuffers: Buffer[] = [];
+      for (let i = 0; i < poses.length; i++) {
+        const b64 = await generatePoseFromReference(
+          client, refB64, poses[i], params.character_description, quality, tmpDir
+        );
         if (!b64) {
           return {
             isError: true,
-            content: [{ type: "text" as const, text: `Error: Frame ${poseIndex + 1} edit returned empty data.` }],
+            content: [{ type: "text" as const, text: `Error: Frame ${i + 1} returned empty data.` }],
           };
         }
-        frameB64s[poseIndex] = b64;
+        processedBuffers.push(await processFrame(b64, bgThreshold, tmpDir));
       }
 
-      fs.unlinkSync(refPath);
-
-      // Step 3: Process all 3 frames — remove bg, crop
-      const processedBuffers: Buffer[] = [];
-      for (let i = 0; i < 3; i++) {
-        const tmpPath = path.join(tmpDir, `sprite_frame_${Date.now()}_${i}.png`);
-        fs.writeFileSync(tmpPath, Buffer.from(frameB64s[i], "base64"));
-        const noBg = await removeWhiteBackground(tmpPath, bgThreshold);
-        const cropped = await cropToContent(noBg);
-        processedBuffers.push(cropped);
-        fs.unlinkSync(tmpPath);
-      }
-
-      // Step 4: Pad all frames to same size and combine horizontally
+      // Step 3: Pad all frames to same size and combine horizontally
       const metaList = await Promise.all(processedBuffers.map((buf) => sharp(buf).metadata()));
       const maxW = Math.max(...metaList.map((m) => m.width ?? 0));
       const maxH = Math.max(...metaList.map((m) => m.height ?? 0));
@@ -1052,7 +1392,7 @@ Example:
         })
       );
 
-      const totalWidth = maxW * 3 + frameGap * 2;
+      const totalWidth = maxW * poses.length + frameGap * (poses.length - 1);
       await sharp({
         create: { width: totalWidth, height: maxH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
       })
@@ -1060,14 +1400,15 @@ Example:
         .composite(paddedBuffers.map((buf, i) => ({ input: buf, left: i * (maxW + frameGap), top: 0 })))
         .toFile(params.output_path);
 
-      const summaryLines = [
-        `Generated sprite sheet: ${params.output_path}`,
-        `Dimensions: ${totalWidth}x${maxH} (3 frames × ${maxW}x${maxH}, gap: ${frameGap}px)`,
-        `Model: gpt-image-1, Quality: ${quality}, BG threshold: ${bgThreshold}`,
-      ];
-
       return {
-        content: [{ type: "text" as const, text: summaryLines.join("\n") }],
+        content: [{
+          type: "text" as const,
+          text: [
+            `Generated sprite sheet: ${params.output_path}`,
+            `Dimensions: ${totalWidth}x${maxH} (${poses.length} frames × ${maxW}x${maxH}, gap: ${frameGap}px)`,
+            `Poses: ${poses.map((p, i) => `\n  [${i + 1}] ${p}`).join("")}`,
+          ].join("\n"),
+        }],
       };
     } catch (error) {
       return {
