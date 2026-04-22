@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "openai-image",
-      "description": "Generate, edit, and create variations of images using OpenAI's image models (DALL-E 2, DALL-E 3, gpt-image-1). Requires OPENAI_API_KEY environment variable.",
+      "description": "Generate, edit, and create variations of images using OpenAI's gpt-image models (gpt-image-2, gpt-image-1.5, gpt-image-1, gpt-image-1-mini). Requires OPENAI_API_KEY environment variable.",
       "source": "./"
     }
   ]

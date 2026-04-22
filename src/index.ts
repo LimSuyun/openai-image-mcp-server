@@ -3,7 +3,8 @@
  * MCP Server for OpenAI GPT Image Generation.
  *
  * Provides tools to generate, edit, and create variations of images
- * using OpenAI's image models: DALL-E 2, DALL-E 3, and gpt-image-1.
+ * using OpenAI's gpt-image models: gpt-image-1, gpt-image-1-mini,
+ * gpt-image-1.5, and gpt-image-2.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -21,13 +22,35 @@ import sharp from "sharp";
 
 const CHARACTER_LIMIT = 25000;
 
+// Supported gpt-image model IDs (DALL-E 2/3 were retired on 2026-05-12)
+const IMAGE_MODELS = [
+  "gpt-image-1",
+  "gpt-image-1-mini",
+  "gpt-image-1.5",
+  "gpt-image-2",
+] as const;
+type ImageModel = (typeof IMAGE_MODELS)[number];
+
+// Model used internally by character/pose/sprite tools. These tools rely on the
+// "pure white background" prompt + flood-fill post-processing rather than the API's
+// `background` parameter, so gpt-image-2 (which lacks native transparent-bg support)
+// is fine here.
+const INTERNAL_IMAGE_MODEL: ImageModel = "gpt-image-2";
+
+// gpt-image edit endpoint accepts up to 25 MB per image (vs. DALL-E's 4 MB).
+const MAX_IMAGE_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+const IMAGE_SIZES = ["1024x1024", "1024x1536", "1536x1024", "auto"] as const;
+const IMAGE_QUALITIES = ["low", "medium", "high", "auto"] as const;
+const OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
+const BACKGROUND_OPTIONS = ["transparent", "opaque", "auto"] as const;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface ImageMeta {
   index: number;
-  url?: string;
   saved_path?: string;
   revised_prompt?: string;
 }
@@ -113,12 +136,13 @@ function getDefaultOutputDir(): string {
 
 function collectImageContent(
   images: OpenAI.Image[],
-  responseFormat: "url" | "b64_json",
   outputDirectory: string | undefined,
-  prefix: string
+  prefix: string,
+  outputFormat: (typeof OUTPUT_FORMATS)[number] = "png"
 ): { content: McpContentItem[]; metadata: ImageMeta[] } {
   const content: McpContentItem[] = [];
   const metadata: ImageMeta[] = [];
+  const mimeType = `image/${outputFormat === "jpeg" ? "jpeg" : outputFormat}`;
 
   for (let i = 0; i < images.length; i++) {
     const img = images[i];
@@ -128,9 +152,10 @@ function collectImageContent(
       meta.revised_prompt = img.revised_prompt;
     }
 
-    if (responseFormat === "b64_json" && img.b64_json) {
+    // gpt-image models always return b64_json (no URL option)
+    if (img.b64_json) {
       const saveDir = outputDirectory ?? getDefaultOutputDir();
-      const filename = `${prefix}_${Date.now()}_${i + 1}.png`;
+      const filename = `${prefix}_${Date.now()}_${i + 1}.${outputFormat}`;
       const filepath = path.join(saveDir, filename);
       fs.writeFileSync(filepath, Buffer.from(img.b64_json, "base64"));
       meta.saved_path = filepath;
@@ -140,15 +165,9 @@ function collectImageContent(
         content.push({
           type: "image",
           data: img.b64_json,
-          mimeType: "image/png",
+          mimeType,
         });
       }
-    } else if (img.url) {
-      meta.url = img.url;
-      content.push({
-        type: "text",
-        text: `Image ${i + 1} URL (valid ~60 min): ${img.url}`,
-      });
     }
 
     metadata.push(meta);
@@ -247,17 +266,12 @@ async function ensureRGBA(filePath: string): Promise<{ resolvedPath: string; con
 
 const server = new McpServer({
   name: "openai-image-mcp-server",
-  version: "1.0.0",
+  version: "2.0.0",
 });
 
 // ---------------------------------------------------------------------------
 // Tool 1: gpt_image_generate
 // ---------------------------------------------------------------------------
-
-enum ResponseFormat {
-  URL = "url",
-  B64_JSON = "b64_json",
-}
 
 const GenerateImageSchema = z
   .object({
@@ -269,13 +283,14 @@ const GenerateImageSchema = z
         "Text description of the desired image. Be specific for best results."
       ),
     model: z
-      .enum(["dall-e-2", "dall-e-3", "gpt-image-1"])
-      .default("gpt-image-1")
+      .enum(IMAGE_MODELS)
+      .default("gpt-image-2")
       .describe(
         "Image generation model. " +
-          "'gpt-image-1' is the latest and most capable model. " +
-          "'dall-e-3' supports style parameter and revised prompts. " +
-          "'dall-e-2' supports generating up to 10 images at once."
+          "'gpt-image-2' (default) is the latest state-of-the-art model — no transparent background. " +
+          "'gpt-image-1.5' is fast and supports transparent backgrounds. " +
+          "'gpt-image-1-mini' is the most cost-efficient option. " +
+          "'gpt-image-1' is the legacy model."
       ),
     n: z
       .number()
@@ -283,47 +298,47 @@ const GenerateImageSchema = z
       .min(1)
       .max(10)
       .default(1)
-      .describe(
-        "Number of images to generate (1–10). " +
-          "dall-e-3 and gpt-image-1 only support n=1."
-      ),
+      .describe("Number of images to generate (1–10)."),
     size: z
-      .enum(["256x256", "512x512", "1024x1024", "1792x1024", "1024x1792"])
+      .enum(IMAGE_SIZES)
       .default("1024x1024")
       .describe(
         "Dimensions of the generated image. " +
-          "256x256 and 512x512 only available for dall-e-2. " +
-          "1792x1024 and 1024x1792 only available for dall-e-3."
+          "'auto' lets the model pick the best aspect ratio for the prompt."
       ),
     quality: z
-      .enum(["standard", "hd", "low", "medium", "high"])
+      .enum(IMAGE_QUALITIES)
       .optional()
       .describe(
-        "Image quality level. " +
-          "'standard'/'hd' for dall-e-3 (hd = finer detail). " +
-          "'low'/'medium'/'high' for gpt-image-1."
+        "Image quality. 'low' is fastest/cheapest, 'high' produces the finest detail. " +
+          "'auto' lets the model pick. Defaults to the model's own default if omitted."
       ),
-    style: z
-      .enum(["vivid", "natural"])
+    background: z
+      .enum(BACKGROUND_OPTIONS)
       .optional()
       .describe(
-        "Visual style (dall-e-3 only). " +
-          "'vivid' = hyper-real and dramatic. 'natural' = realistic, less exaggerated."
+        "Background handling. 'transparent' requires output_format='png' or 'webp'. " +
+          "Not supported on gpt-image-2."
       ),
-    response_format: z
-      .nativeEnum(ResponseFormat)
-      .default(ResponseFormat.URL)
+    output_format: z
+      .enum(OUTPUT_FORMATS)
+      .default("png")
+      .describe("Output image file format."),
+    output_compression: z
+      .number()
+      .int()
+      .min(0)
+      .max(100)
+      .optional()
       .describe(
-        "Return format. 'url' gives download links (valid ~60 min). " +
-          "'b64_json' embeds image data in the response. " +
-          "Note: gpt-image-1 only supports 'b64_json' — 'url' will be ignored and overridden automatically."
+        "Compression level (0–100) for jpeg/webp output. Ignored for png."
       ),
     output_directory: z
       .string()
       .optional()
       .describe(
-        "Directory to save generated images as PNG files. " +
-          "Only works when response_format='b64_json'."
+        "Directory to save generated images. Images are always returned as base64 " +
+          "and written to disk. Defaults to './openai-image-gen' if omitted."
       ),
   })
   .strict();
@@ -334,28 +349,30 @@ server.registerTool(
   "gpt_image_generate",
   {
     title: "Generate Image",
-    description: `Generate one or more images from a text prompt using OpenAI's image models.
+    description: `Generate one or more images from a text prompt using OpenAI's gpt-image models.
 
-Supports DALL-E 2, DALL-E 3, and gpt-image-1. Returns images as URLs or embedded base64 data.
+All images are returned as base64 data and saved to disk (gpt-image models do not produce URLs).
 
 Args:
   - prompt (string, required): Text description. Max 4000 chars.
-  - model ('dall-e-2'|'dall-e-3'|'gpt-image-1'): Model to use. Default: 'gpt-image-1'
-  - n (number): Images to generate, 1-10. DALL-E 3 and gpt-image-1 only support n=1. Default: 1
-  - size ('256x256'|'512x512'|'1024x1024'|'1792x1024'|'1024x1792'): Dimensions. Default: '1024x1024'
-  - quality ('standard'|'hd'|'low'|'medium'|'high'): Quality level. Optional.
-  - style ('vivid'|'natural'): Visual style, dall-e-3 only. Optional.
-  - response_format ('url'|'b64_json'): Return format. Default: 'url'
-  - output_directory (string): Directory to save PNG files (requires response_format='b64_json'). Optional.
+  - model ('gpt-image-1'|'gpt-image-1-mini'|'gpt-image-1.5'|'gpt-image-2'): Default: 'gpt-image-2'
+  - n (number): Images to generate, 1–10. Default: 1
+  - size ('1024x1024'|'1024x1536'|'1536x1024'|'auto'): Dimensions. Default: '1024x1024'
+  - quality ('low'|'medium'|'high'|'auto'): Quality level. Optional.
+  - background ('transparent'|'opaque'|'auto'): Transparent background requires png/webp. Not supported on gpt-image-2. Optional.
+  - output_format ('png'|'jpeg'|'webp'): Output file format. Default: 'png'
+  - output_compression (number, 0–100): Compression for jpeg/webp. Optional.
+  - output_directory (string): Directory to save files. Defaults to './openai-image-gen'. Optional.
 
 Returns:
-  - Image URLs or embedded base64 image data
-  - Metadata: model used, revised prompt (dall-e-3), saved file paths
+  - Embedded base64 image data (if under size limit)
+  - Metadata: model used, saved file paths
 
 Examples:
   - "A photorealistic portrait of a tabby cat sitting on a windowsill"
-  - model="dall-e-3", quality="hd", prompt="Detailed oil painting of a medieval castle"
-  - size="1792x1024", prompt="Wide cinematic shot of a foggy mountain valley at sunrise"`,
+  - model="gpt-image-2", quality="high", prompt="Detailed oil painting of a medieval castle"
+  - size="1536x1024", prompt="Wide cinematic shot of a foggy mountain valley at sunrise"
+  - background="transparent", prompt="A glowing magic crystal, PNG with transparent bg"`,
     inputSchema: GenerateImageSchema,
     annotations: {
       readOnlyHint: false,
@@ -366,62 +383,67 @@ Examples:
   },
   async (params: GenerateImageInput) => {
     try {
-      // gpt-image-1 does not accept response_format param; always returns b64_json
-      const isGptImage1 = params.model === "gpt-image-1";
-      const responseFormat = isGptImage1 ? ResponseFormat.B64_JSON : params.response_format;
+      if (params.background === "transparent" && params.output_format === "jpeg") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "Error: background='transparent' requires output_format='png' or 'webp' (jpeg has no alpha channel).",
+            },
+          ],
+        };
+      }
+
+      if (params.model === "gpt-image-2" && params.background === "transparent") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Error: gpt-image-2 does not support transparent backgrounds. " +
+                "Use gpt-image-1, gpt-image-1-mini, or gpt-image-1.5 instead.",
+            },
+          ],
+        };
+      }
 
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
         }
-        if (responseFormat !== ResponseFormat.B64_JSON) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  "Error: output_directory requires response_format='b64_json'. " +
-                  "Set response_format='b64_json' to save files.",
-              },
-            ],
-          };
-        }
       }
 
       const client = getClient();
 
-      const requestParams: OpenAI.Images.ImageGenerateParams = {
+      // gpt-image parameters are passed through; cast via `any` because the installed
+      // openai SDK typings predate the full gpt-image schema (background/output_format/etc.).
+      const requestParams: Record<string, unknown> = {
         prompt: params.prompt,
         model: params.model,
         n: params.n,
-        size: params.size as OpenAI.Images.ImageGenerateParams["size"],
+        size: params.size,
       };
 
-      // gpt-image-1 does not support response_format parameter
-      if (!isGptImage1) {
-        requestParams.response_format =
-          responseFormat as OpenAI.Images.ImageGenerateParams["response_format"];
+      if (params.quality) requestParams.quality = params.quality;
+      if (params.background) requestParams.background = params.background;
+      if (params.output_format) requestParams.output_format = params.output_format;
+      if (params.output_compression !== undefined) {
+        requestParams.output_compression = params.output_compression;
       }
 
-      if (params.quality) {
-        requestParams.quality =
-          params.quality as OpenAI.Images.ImageGenerateParams["quality"];
-      }
-      if (params.style && params.model === "dall-e-3") {
-        requestParams.style =
-          params.style as OpenAI.Images.ImageGenerateParams["style"];
-      }
-
-      const response = await client.images.generate(requestParams);
+      const response = await client.images.generate(
+        requestParams as unknown as OpenAI.Images.ImageGenerateParams
+      );
       const images = response.data ?? [];
 
       const { content, metadata } = collectImageContent(
         images,
-        responseFormat,
         params.output_directory,
-        "generated"
+        "generated",
+        params.output_format
       );
 
       const summaryLines = [
@@ -431,7 +453,6 @@ Examples:
       for (const m of metadata) {
         summaryLines.push(`\nImage ${m.index}:`);
         if (m.revised_prompt) summaryLines.push(`  Revised prompt: ${m.revised_prompt}`);
-        if (m.url) summaryLines.push(`  URL: ${m.url}`);
         if (m.saved_path) summaryLines.push(`  Saved: ${m.saved_path}`);
       }
 
@@ -465,13 +486,13 @@ const EditImageSchema = z
       .min(1, "image_path is required")
       .describe(
         "Absolute path to the PNG image file to edit. " +
-          "Must be PNG format, under 4 MB. " +
+          "Must be PNG format, under 25 MB. " +
           "Oversized images are automatically resized. RGB images are auto-converted to RGBA."
       ),
     prompt: z
       .string()
       .min(1, "Prompt is required")
-      .max(1000, "Prompt must not exceed 1000 characters")
+      .max(32000, "Prompt must not exceed 32000 characters")
       .describe("Text description of the desired edit."),
     mask_path: z
       .string()
@@ -482,9 +503,12 @@ const EditImageSchema = z
           "If omitted the entire image is eligible for editing."
       ),
     model: z
-      .enum(["dall-e-2"])
-      .default("dall-e-2")
-      .describe("Model for editing. Only dall-e-2 supports image editing."),
+      .enum(IMAGE_MODELS)
+      .default("gpt-image-2")
+      .describe(
+        "Editing model. 'gpt-image-2' (default) is the highest quality but has no transparent background. " +
+          "Use 'gpt-image-1.5' when you need transparent-bg editing."
+      ),
     n: z
       .number()
       .int()
@@ -493,19 +517,36 @@ const EditImageSchema = z
       .default(1)
       .describe("Number of edited images to produce (1–10)."),
     size: z
-      .enum(["256x256", "512x512", "1024x1024"])
+      .enum(IMAGE_SIZES)
       .default("1024x1024")
-      .describe("Output image dimensions."),
-    response_format: z
-      .nativeEnum(ResponseFormat)
-      .default(ResponseFormat.URL)
-      .describe("Return format: 'url' or 'b64_json'."),
+      .describe("Output dimensions. 'auto' lets the model pick."),
+    quality: z
+      .enum(IMAGE_QUALITIES)
+      .optional()
+      .describe("Quality level (low/medium/high/auto). Optional."),
+    background: z
+      .enum(BACKGROUND_OPTIONS)
+      .optional()
+      .describe(
+        "Background handling. 'transparent' requires output_format='png' or 'webp'. " +
+          "Not supported on gpt-image-2."
+      ),
+    output_format: z
+      .enum(OUTPUT_FORMATS)
+      .default("png")
+      .describe("Output image file format."),
+    output_compression: z
+      .number()
+      .int()
+      .min(0)
+      .max(100)
+      .optional()
+      .describe("Compression level (0–100) for jpeg/webp output."),
     output_directory: z
       .string()
       .optional()
       .describe(
-        "Directory to save edited images as PNG files. " +
-          "Requires response_format='b64_json'."
+        "Directory to save edited images. Defaults to './openai-image-gen' if omitted."
       ),
   })
   .strict();
@@ -521,17 +562,20 @@ server.registerTool(
 Transparent areas in the mask indicate regions to edit. Without a mask, the model may edit the whole image.
 
 Args:
-  - image_path (string, required): Absolute path to PNG image (< 4 MB). Auto-resized if over limit. RGB images are auto-converted to RGBA.
-  - prompt (string, required): Description of the desired edit. Max 1000 chars.
+  - image_path (string, required): Absolute path to PNG image (< 25 MB). Auto-resized if over limit. RGB auto-converted to RGBA.
+  - prompt (string, required): Description of the desired edit.
   - mask_path (string): Absolute path to PNG mask. Transparent pixels = edit zone. Optional.
-  - model ('dall-e-2'|'gpt-image-1'): Model to use. Default: 'gpt-image-1'
+  - model ('gpt-image-1'|'gpt-image-1-mini'|'gpt-image-1.5'|'gpt-image-2'): Default: 'gpt-image-2'
   - n (number): Number of results (1–10). Default: 1
-  - size ('256x256'|'512x512'|'1024x1024'): Output size. Default: '1024x1024'
-  - response_format ('url'|'b64_json'): Return format. Default: 'url'
-  - output_directory (string): Directory to save PNG files (requires response_format='b64_json'). Optional.
+  - size ('1024x1024'|'1024x1536'|'1536x1024'|'auto'): Output size. Default: '1024x1024'
+  - quality ('low'|'medium'|'high'|'auto'): Quality level. Optional.
+  - background ('transparent'|'opaque'|'auto'): Not supported on gpt-image-2. Optional.
+  - output_format ('png'|'jpeg'|'webp'): Default: 'png'
+  - output_compression (0–100): For jpeg/webp. Optional.
+  - output_directory (string): Save directory. Defaults to './openai-image-gen'. Optional.
 
 Returns:
-  - Edited image(s) as URLs or embedded base64 data
+  - Edited image(s) as embedded base64 data and saved file paths.
 
 Examples:
   - Add object: image_path="/photos/room.png", prompt="Add a potted plant near the window"
@@ -554,8 +598,32 @@ Examples:
         };
       }
 
+      if (params.background === "transparent" && params.output_format === "jpeg") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "Error: background='transparent' requires output_format='png' or 'webp'.",
+            },
+          ],
+        };
+      }
+
+      if (params.model === "gpt-image-2" && params.background === "transparent") {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: "Error: gpt-image-2 does not support transparent backgrounds.",
+            },
+          ],
+        };
+      }
+
       const { resolvedPath: resolvedImagePath, resizeNote: imageResizeNote } =
-        await resizeImageToFitLimit(params.image_path, 4 * 1024 * 1024);
+        await resizeImageToFitLimit(params.image_path, MAX_IMAGE_UPLOAD_BYTES);
 
       if (params.mask_path && !fs.existsSync(params.mask_path)) {
         return {
@@ -568,24 +636,13 @@ Examples:
       let maskResizeNote: string | null = null;
       if (params.mask_path) {
         ({ resolvedPath: resolvedMaskPath, resizeNote: maskResizeNote } =
-          await resizeImageToFitLimit(params.mask_path, 4 * 1024 * 1024));
+          await resizeImageToFitLimit(params.mask_path, MAX_IMAGE_UPLOAD_BYTES));
       }
 
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
-        }
-        if (params.response_format !== ResponseFormat.B64_JSON) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: output_directory requires response_format='b64_json'.",
-              },
-            ],
-          };
         }
       }
 
@@ -602,29 +659,40 @@ Examples:
       const client = getClient();
       const imageName = path.basename(rgbaImagePath);
 
-      const requestParams: OpenAI.Images.ImageEditParams = {
+      const requestParams: Record<string, unknown> = {
         image: await toFile(fs.createReadStream(rgbaImagePath), imageName, { type: "image/png" }),
         prompt: params.prompt,
         model: params.model,
         n: params.n,
-        size: params.size as OpenAI.Images.ImageEditParams["size"],
-        response_format:
-          params.response_format as OpenAI.Images.ImageEditParams["response_format"],
+        size: params.size,
       };
+
+      if (params.quality) requestParams.quality = params.quality;
+      if (params.background) requestParams.background = params.background;
+      if (params.output_format) requestParams.output_format = params.output_format;
+      if (params.output_compression !== undefined) {
+        requestParams.output_compression = params.output_compression;
+      }
 
       if (rgbaMaskPath) {
         const maskName = path.basename(rgbaMaskPath);
-        requestParams.mask = await toFile(fs.createReadStream(rgbaMaskPath), maskName, { type: "image/png" });
+        requestParams.mask = await toFile(
+          fs.createReadStream(rgbaMaskPath),
+          maskName,
+          { type: "image/png" }
+        );
       }
 
-      const response = await client.images.edit(requestParams);
+      const response = await client.images.edit(
+        requestParams as unknown as OpenAI.Images.ImageEditParams
+      );
       const images = response.data ?? [];
 
       const { content, metadata } = collectImageContent(
         images,
-        params.response_format,
         params.output_directory,
-        "edited"
+        "edited",
+        params.output_format
       );
 
       const summaryLines = [
@@ -638,7 +706,6 @@ Examples:
       if (maskConvertNote) summaryLines.push(maskConvertNote);
       for (const m of metadata) {
         summaryLines.push(`\nImage ${m.index}:`);
-        if (m.url) summaryLines.push(`  URL: ${m.url}`);
         if (m.saved_path) summaryLines.push(`  Saved: ${m.saved_path}`);
       }
 
@@ -661,14 +728,32 @@ Examples:
 // Tool 3: gpt_image_create_variation
 // ---------------------------------------------------------------------------
 
+const DEFAULT_VARIATION_PROMPT =
+  "Create a new artistic variation of this image. Preserve the main subject and overall " +
+  "composition but introduce distinct variations in style, lighting, color palette, mood, " +
+  "or framing. Produce a recognizable but visually different interpretation of the source.";
+
 const CreateVariationSchema = z
   .object({
     image_path: z
       .string()
       .min(1, "image_path is required")
       .describe(
-        "Absolute path to the PNG image file to vary. " +
-          "Must be square and under 4 MB. Only DALL-E 2 supports this operation."
+        "Absolute path to the PNG image file to vary. Under 25 MB. Auto-resized if larger."
+      ),
+    variation_prompt: z
+      .string()
+      .max(32000)
+      .optional()
+      .describe(
+        "Optional custom prompt describing the kind of variation to produce. " +
+          "If omitted, a default 'stylistic variation' prompt is used."
+      ),
+    model: z
+      .enum(IMAGE_MODELS)
+      .default("gpt-image-2")
+      .describe(
+        "Model for variation (implemented via the edit endpoint). Default: 'gpt-image-2'"
       ),
     n: z
       .number()
@@ -678,20 +763,28 @@ const CreateVariationSchema = z
       .default(1)
       .describe("Number of variations to generate (1–10)."),
     size: z
-      .enum(["256x256", "512x512", "1024x1024"])
+      .enum(IMAGE_SIZES)
       .default("1024x1024")
-      .describe("Output dimensions."),
-    response_format: z
-      .nativeEnum(ResponseFormat)
-      .default(ResponseFormat.URL)
-      .describe("Return format: 'url' or 'b64_json'."),
+      .describe("Output dimensions. 'auto' lets the model pick."),
+    quality: z
+      .enum(IMAGE_QUALITIES)
+      .optional()
+      .describe("Quality level. Optional."),
+    output_format: z
+      .enum(OUTPUT_FORMATS)
+      .default("png")
+      .describe("Output image file format."),
+    output_compression: z
+      .number()
+      .int()
+      .min(0)
+      .max(100)
+      .optional()
+      .describe("Compression level (0–100) for jpeg/webp."),
     output_directory: z
       .string()
       .optional()
-      .describe(
-        "Directory to save variation images as PNG files. " +
-          "Requires response_format='b64_json'."
-      ),
+      .describe("Directory to save files. Defaults to './openai-image-gen'."),
   })
   .strict();
 
@@ -701,23 +794,29 @@ server.registerTool(
   "gpt_image_create_variation",
   {
     title: "Create Image Variation",
-    description: `Create one or more stylistic variations of an existing image using DALL-E 2.
+    description: `Create one or more artistic variations of an existing image.
 
-Note: Only DALL-E 2 supports this operation. Input must be a square PNG under 4 MB.
+Implemented on top of the gpt-image edit endpoint because the legacy DALL-E 2 variations endpoint
+was retired on 2026-05-12. Pass a custom 'variation_prompt' for targeted variations, or rely on the
+default "stylistic variation" prompt for generic reinterpretations.
 
 Args:
-  - image_path (string, required): Absolute path to source PNG (square, < 4 MB)
-  - n (number): Number of variations to generate (1–10). Default: 1
-  - size ('256x256'|'512x512'|'1024x1024'): Output size. Default: '1024x1024'
-  - response_format ('url'|'b64_json'): Return format. Default: 'url'
-  - output_directory (string): Directory to save PNG files (requires response_format='b64_json'). Optional.
+  - image_path (string, required): Absolute path to source PNG (< 25 MB).
+  - variation_prompt (string): Custom instruction for the variation. Optional.
+  - model ('gpt-image-1'|'gpt-image-1-mini'|'gpt-image-1.5'|'gpt-image-2'): Default: 'gpt-image-2'
+  - n (number): Number of variations (1–10). Default: 1
+  - size ('1024x1024'|'1024x1536'|'1536x1024'|'auto'): Default: '1024x1024'
+  - quality ('low'|'medium'|'high'|'auto'): Optional.
+  - output_format ('png'|'jpeg'|'webp'): Default: 'png'
+  - output_compression (0–100): For jpeg/webp. Optional.
+  - output_directory (string): Save directory. Defaults to './openai-image-gen'.
 
 Returns:
-  - Variation image(s) as URLs or embedded base64 data
+  - Variation image(s) as embedded base64 data and saved file paths.
 
 Examples:
   - 3 variations: image_path="/art/original.png", n=3
-  - Save to disk: image_path="/img.png", n=2, response_format="b64_json", output_directory="/output"`,
+  - Targeted: image_path="/photo.png", variation_prompt="Reinterpret as oil painting with warm sunset tones"`,
     inputSchema: CreateVariationSchema,
     annotations: {
       readOnlyHint: false,
@@ -736,53 +835,55 @@ Examples:
       }
 
       const { resolvedPath: resolvedImagePath, resizeNote } =
-        await resizeImageToFitLimit(params.image_path, 4 * 1024 * 1024);
+        await resizeImageToFitLimit(params.image_path, MAX_IMAGE_UPLOAD_BYTES);
 
       if (params.output_directory) {
         const dirError = validateOutputDirectory(params.output_directory);
         if (dirError) {
           return { isError: true, content: [{ type: "text" as const, text: dirError }] };
         }
-        if (params.response_format !== ResponseFormat.B64_JSON) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: output_directory requires response_format='b64_json'.",
-              },
-            ],
-          };
-        }
       }
 
+      const { resolvedPath: rgbaImagePath, convertNote } = await ensureRGBA(resolvedImagePath);
+
       const client = getClient();
+      const imageName = path.basename(rgbaImagePath);
+      const variationPrompt = params.variation_prompt ?? DEFAULT_VARIATION_PROMPT;
 
-      const response = await client.images.createVariation({
-        image: fs.createReadStream(resolvedImagePath),
+      const requestParams: Record<string, unknown> = {
+        image: await toFile(fs.createReadStream(rgbaImagePath), imageName, { type: "image/png" }),
+        prompt: variationPrompt,
+        model: params.model,
         n: params.n,
-        size: params.size as OpenAI.Images.ImageCreateVariationParams["size"],
-        response_format:
-          params.response_format as OpenAI.Images.ImageCreateVariationParams["response_format"],
-      });
+        size: params.size,
+      };
+      if (params.quality) requestParams.quality = params.quality;
+      if (params.output_format) requestParams.output_format = params.output_format;
+      if (params.output_compression !== undefined) {
+        requestParams.output_compression = params.output_compression;
+      }
 
+      const response = await client.images.edit(
+        requestParams as unknown as OpenAI.Images.ImageEditParams
+      );
       const images = response.data ?? [];
 
       const { content, metadata } = collectImageContent(
         images,
-        params.response_format,
         params.output_directory,
-        "variation"
+        "variation",
+        params.output_format
       );
 
       const summaryLines = [
-        `Created ${images.length} variation(s) with dall-e-2`,
+        `Created ${images.length} variation(s) with ${params.model} (via edit endpoint)`,
         `Source: ${params.image_path}`,
+        `Prompt: "${variationPrompt}"`,
       ];
       if (resizeNote) summaryLines.push(resizeNote);
+      if (convertNote) summaryLines.push(convertNote);
       for (const m of metadata) {
         summaryLines.push(`\nVariation ${m.index}:`);
-        if (m.url) summaryLines.push(`  URL: ${m.url}`);
         if (m.saved_path) summaryLines.push(`  Saved: ${m.saved_path}`);
       }
 
@@ -923,8 +1024,9 @@ async function generatePoseFromReference(
   const response = await client.images.edit({
     image: await toFile(fs.createReadStream(srcPath), "reference.png", { type: "image/png" }),
     prompt: editPrompt,
-    model: "gpt-image-1",
+    model: INTERNAL_IMAGE_MODEL,
     size: "1024x1024",
+    ...(quality ? { quality: quality as OpenAI.Images.ImageEditParams["quality"] } : {}),
   });
 
   fs.unlinkSync(srcPath);
@@ -1046,7 +1148,7 @@ Example:
 
       const response = await client.images.generate({
         prompt,
-        model: "gpt-image-1",
+        model: INTERNAL_IMAGE_MODEL,
         size: "1024x1024",
         quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
       });
@@ -1062,15 +1164,16 @@ Example:
       const processed = await processFrame(b64, bgThreshold, tmpDir);
       fs.writeFileSync(params.output_path, processed);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Character reference saved: ${params.output_path}\nUse this path with gpt_image_generate_pose to create any pose.`,
-          },
-          { type: "image" as const, data: b64, mimeType: "image/png" },
-        ],
-      };
+      const refContent: McpContentItem[] = [
+        {
+          type: "text" as const,
+          text: `Character reference saved: ${params.output_path}\nUse this path with gpt_image_generate_pose to create any pose.`,
+        },
+      ];
+      if (b64.length <= MCP_INLINE_SIZE_LIMIT) {
+        refContent.push({ type: "image" as const, data: b64, mimeType: "image/png" });
+      }
+      return { content: refContent };
     } catch (error) {
       return {
         isError: true,
@@ -1201,12 +1304,13 @@ Examples:
       const processed = await processFrame(b64, bgThreshold, tmpDir);
       fs.writeFileSync(params.output_path, processed);
 
-      return {
-        content: [
-          { type: "text" as const, text: `Pose saved: ${params.output_path}` },
-          { type: "image" as const, data: b64, mimeType: "image/png" },
-        ],
-      };
+      const poseContent: McpContentItem[] = [
+        { type: "text" as const, text: `Pose saved: ${params.output_path}` },
+      ];
+      if (b64.length <= MCP_INLINE_SIZE_LIMIT) {
+        poseContent.push({ type: "image" as const, data: b64, mimeType: "image/png" });
+      }
+      return { content: poseContent };
     } catch (error) {
       return {
         isError: true,
@@ -1347,7 +1451,7 @@ Examples:
 
       const refResponse = await client.images.generate({
         prompt: refPrompt,
-        model: "gpt-image-1",
+        model: INTERNAL_IMAGE_MODEL,
         size: "1024x1024",
         quality: quality as OpenAI.Images.ImageGenerateParams["quality"],
       });

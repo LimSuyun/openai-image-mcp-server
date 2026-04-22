@@ -1,6 +1,8 @@
 # openai-image-mcp-server
 
-An MCP server for OpenAI image generation. Generate, edit, and create variations of images using DALL-E 2, DALL-E 3, and gpt-image-1 — directly from any MCP-compatible client like Claude Desktop, Cursor, or VS Code.
+An MCP server for OpenAI image generation. Generate, edit, and create variations of images using the gpt-image model family (`gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`) — directly from any MCP-compatible client like Claude Desktop, Cursor, or VS Code.
+
+> **DALL-E 2 / DALL-E 3 removed.** OpenAI retired both DALL-E models on 2026-05-12. This server now targets only the gpt-image family. The `gpt_image_create_variation` tool is re-implemented on top of the edit endpoint because the legacy `/v1/images/variations` endpoint went away with DALL-E 2.
 
 ## Tools
 
@@ -8,7 +10,7 @@ An MCP server for OpenAI image generation. Generate, edit, and create variations
 |---|---|
 | `gpt_image_generate` | Generate images from a text prompt |
 | `gpt_image_edit` | Edit an existing image with inpainting/masking |
-| `gpt_image_create_variation` | Create stylistic variations of an image (DALL-E 2) |
+| `gpt_image_create_variation` | Create stylistic variations of an image (via edit endpoint) |
 | `gpt_image_create_character_reference` | Generate a base reference image for a game character |
 | `gpt_image_generate_pose` | Generate any pose/action from a character reference image |
 | `gpt_image_generate_sprite_sheet` | Generate a multi-frame sprite sheet (convenience wrapper) |
@@ -118,21 +120,16 @@ Generate one or more images from a text prompt.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | string | required | Text description of the image |
-| `model` | `dall-e-2` \| `dall-e-3` \| `gpt-image-1` | `gpt-image-1` | Model to use |
-| `n` | number (1–10) | `1` | Number of images (DALL-E 3 and gpt-image-1 support n=1 only) |
-| `size` | see below | `1024x1024` | Output dimensions |
-| `quality` | `standard` \| `hd` \| `low` \| `medium` \| `high` | — | Quality level |
-| `style` | `vivid` \| `natural` | — | Visual style (DALL-E 3 only) |
-| `response_format` | `url` \| `b64_json` | `url` | Return URLs or embedded base64 data |
-| `output_directory` | string | — | Save images to this directory (requires `b64_json`) |
+| `model` | `gpt-image-1` \| `gpt-image-1-mini` \| `gpt-image-1.5` \| `gpt-image-2` | `gpt-image-2` | Model to use |
+| `n` | number (1–10) | `1` | Number of images |
+| `size` | `1024x1024` \| `1024x1536` \| `1536x1024` \| `auto` | `1024x1024` | Output dimensions |
+| `quality` | `low` \| `medium` \| `high` \| `auto` | — | Quality level |
+| `background` | `transparent` \| `opaque` \| `auto` | — | Transparent requires png/webp. Not supported on gpt-image-2 |
+| `output_format` | `png` \| `jpeg` \| `webp` | `png` | Output file format |
+| `output_compression` | number (0–100) | — | Compression for jpeg/webp |
+| `output_directory` | string | `./openai-image-gen` | Directory for saved files |
 
-**Supported sizes by model:**
-
-| Model | Supported sizes |
-|---|---|
-| `dall-e-2` | `256x256`, `512x512`, `1024x1024` |
-| `dall-e-3` | `1024x1024`, `1792x1024`, `1024x1792` |
-| `gpt-image-1` | `1024x1024`, `1792x1024`, `1024x1792` |
+> Images are always returned as base64 data and written to disk. gpt-image models do not produce URLs.
 
 **Examples:**
 
@@ -142,12 +139,12 @@ Generate a photorealistic portrait of a tabby cat sitting on a windowsill
 
 ```
 Generate a wide cinematic shot of a foggy mountain valley at sunrise
-  → model: dall-e-3, size: 1792x1024, quality: hd
+  → model: gpt-image-2, size: 1536x1024, quality: high
 ```
 
 ```
-Generate abstract digital art and save it to /Users/me/images
-  → response_format: b64_json, output_directory: /Users/me/images
+Generate a glowing magic crystal with transparent background
+  → background: transparent, output_format: png
 ```
 
 ---
@@ -158,14 +155,17 @@ Edit an existing image using a text prompt. Supports inpainting with an optional
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `image_path` | string | required | Absolute path to source PNG (square, < 4 MB) |
+| `image_path` | string | required | Absolute path to source PNG (< 25 MB, auto-resized) |
 | `prompt` | string | required | Description of the desired edit |
 | `mask_path` | string | — | Absolute path to mask PNG (transparent = edit zone) |
-| `model` | `dall-e-2` | `dall-e-2` | Model to use (only dall-e-2 supports editing) |
+| `model` | `gpt-image-1` \| `gpt-image-1-mini` \| `gpt-image-1.5` \| `gpt-image-2` | `gpt-image-2` | Model to use |
 | `n` | number (1–10) | `1` | Number of results |
-| `size` | `256x256` \| `512x512` \| `1024x1024` | `1024x1024` | Output dimensions |
-| `response_format` | `url` \| `b64_json` | `url` | Return format |
-| `output_directory` | string | — | Save results to this directory (requires `b64_json`) |
+| `size` | `1024x1024` \| `1024x1536` \| `1536x1024` \| `auto` | `1024x1024` | Output dimensions |
+| `quality` | `low` \| `medium` \| `high` \| `auto` | — | Quality level |
+| `background` | `transparent` \| `opaque` \| `auto` | — | Not supported on gpt-image-2 |
+| `output_format` | `png` \| `jpeg` \| `webp` | `png` | Output file format |
+| `output_compression` | number (0–100) | — | Compression for jpeg/webp |
+| `output_directory` | string | `./openai-image-gen` | Directory for saved files |
 
 **Examples:**
 
@@ -181,21 +181,32 @@ Edit /photos/portrait.png with mask /photos/mask.png → "Replace background wit
 
 ### `gpt_image_create_variation`
 
-Create stylistic variations of an existing image. Uses DALL-E 2.
+Create artistic variations of an existing image.
+
+Implemented on top of the edit endpoint because the legacy `/v1/images/variations` endpoint was retired with DALL-E 2 on 2026-05-12. Pass `variation_prompt` for targeted variations or rely on the default "stylistic variation" prompt.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `image_path` | string | required | Absolute path to source PNG (square, < 4 MB) |
+| `image_path` | string | required | Absolute path to source PNG (< 25 MB) |
+| `variation_prompt` | string | built-in default | Custom instruction describing the variation |
+| `model` | `gpt-image-1` \| `gpt-image-1-mini` \| `gpt-image-1.5` \| `gpt-image-2` | `gpt-image-2` | Model to use |
 | `n` | number (1–10) | `1` | Number of variations |
-| `size` | `256x256` \| `512x512` \| `1024x1024` | `1024x1024` | Output dimensions |
-| `response_format` | `url` \| `b64_json` | `url` | Return format |
-| `output_directory` | string | — | Save results to this directory (requires `b64_json`) |
+| `size` | `1024x1024` \| `1024x1536` \| `1536x1024` \| `auto` | `1024x1024` | Output dimensions |
+| `quality` | `low` \| `medium` \| `high` \| `auto` | — | Quality level |
+| `output_format` | `png` \| `jpeg` \| `webp` | `png` | Output file format |
+| `output_compression` | number (0–100) | — | Compression for jpeg/webp |
+| `output_directory` | string | `./openai-image-gen` | Directory for saved files |
 
-**Example:**
+**Examples:**
 
 ```
 Create 3 variations of /art/original.png
-  → n: 3, response_format: b64_json, output_directory: /art/variations
+  → n: 3, output_directory: /art/variations
+```
+
+```
+Reinterpret /photo.png as oil painting with warm sunset tones
+  → variation_prompt: "Reinterpret as oil painting with warm sunset tones"
 ```
 
 ---
@@ -293,27 +304,26 @@ Aggressive background removal for a character with light-colored clothing
 
 ## Model Comparison
 
-| | DALL-E 2 | DALL-E 3 | gpt-image-1 |
-|---|---|---|---|
-| Generate | ✓ | ✓ | ✓ |
-| Edit | ✓ | ✗ | ✗ |
-| Variation | ✓ | ✗ | ✗ |
-| Sprite sheet | ✗ | ✗ | ✓ |
-| Max images (n) | 10 | 1 | 1 |
-| Style parameter | ✗ | ✓ | ✗ |
-| Revised prompt | ✗ | ✓ | ✗ |
-| Best for | Variations, bulk | High quality, artistic | Latest capability, sprites |
+| | gpt-image-1 | gpt-image-1-mini | gpt-image-1.5 | gpt-image-2 |
+|---|---|---|---|---|
+| Generate | ✓ | ✓ | ✓ | ✓ |
+| Edit | ✓ | ✓ | ✓ | ✓ |
+| Variation (via edit) | ✓ | ✓ | ✓ | ✓ |
+| Transparent background | ✓ | ✓ | ✓ | ✗ |
+| Sizes | 1024² / 1024×1536 / 1536×1024 | same | same | flexible (≤3840px, 16px multiples) |
+| Output formats | png / jpeg / webp | same | same | same |
+| Best for | Legacy | Cost-efficient bulk | Fast + transparent bg | **Default** · state-of-the-art quality, text rendering |
 
 ## Saving Images to Disk
 
-Set `response_format` to `b64_json` and provide an `output_directory` to save generated images as PNG files:
+All gpt-image models return base64 data (no URLs). Generated images are automatically written to disk — pass `output_directory` to customize the location, otherwise files land in `./openai-image-gen`.
 
 ```
 Generate a sunset landscape and save it
-  → response_format: b64_json, output_directory: /Users/me/Desktop
+  → output_directory: /Users/me/Desktop
 ```
 
-Files are saved as `generated_<timestamp>_<n>.png`, `edited_<timestamp>_<n>.png`, or `variation_<timestamp>_<n>.png`.
+Files are saved as `generated_<timestamp>_<n>.<ext>`, `edited_<timestamp>_<n>.<ext>`, or `variation_<timestamp>_<n>.<ext>` where `<ext>` matches `output_format` (default `png`).
 
 ## License
 

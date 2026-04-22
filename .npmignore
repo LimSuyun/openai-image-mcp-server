@@ -1,5 +1,6 @@
 src/
 .claude/
+.mcp.json
 *.map
 tsconfig.json
 test_output/

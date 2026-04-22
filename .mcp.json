@@ -3,7 +3,7 @@
     "openai-image": {
       "type": "stdio",
       "command": "node",
-      "args": ["/Users/lsy/gpt_image_gen_mcp/dist/index.js"]
+      "args": ["./dist/index.js"]
     }
   }
 }
